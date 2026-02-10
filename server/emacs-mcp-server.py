@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -85,6 +86,9 @@ TOOL_SPECS = (
 )
 TOOL_NAMES = tuple(spec["name"] for spec in TOOL_SPECS)
 MCP_PROTOCOL_VERSION = "2025-11-25"
+BRIDGE_CONNECT_TIMEOUT_S = 1.0
+BRIDGE_READ_TIMEOUT_S = 5.0
+BRIDGE_MAX_LINE_BYTES = 1024 * 1024
 
 
 # JSON response templates
@@ -166,10 +170,86 @@ class EmacsRpcClient:
 
     def __init__(self, socket_path: Path) -> None:
         self.socket_path = socket_path
+        self._next_id = 1
 
     def call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
         """Call a bridge method on the Emacs side."""
-        raise NotImplementedError
+        assert isinstance(method, str) and method, "Bridge method must be a non-empty string"
+        if params is None:
+            params = {}
+        assert isinstance(params, dict), "Bridge params must be an object"
+
+        request_id = self._next_id
+        self._next_id += 1
+
+        request = {"id": request_id, "method": method, "params": params}
+        request_line = json.dumps(request, separators=(",", ":")) + "\n"
+
+        response_line: bytes
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client_socket:
+                client_socket.settimeout(BRIDGE_CONNECT_TIMEOUT_S)
+                client_socket.connect(str(self.socket_path))
+                client_socket.settimeout(BRIDGE_READ_TIMEOUT_S)
+                client_socket.sendall(request_line.encode("utf-8"))
+                response_line = self._readline_with_size_limit(client_socket, BRIDGE_MAX_LINE_BYTES)
+        except socket.timeout:
+            raise ToolError("emacs_error", "Timed out waiting for Emacs bridge response")
+        except (FileNotFoundError, ConnectionRefusedError):
+            raise ToolError("emacs_unreachable", "Emacs bridge socket is unavailable")
+        except OSError as exc:
+            raise ToolError("emacs_unreachable", f"Failed to reach Emacs bridge: {exc}")
+
+        try:
+            response = json.loads(response_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise ToolError("invalid_response", "Emacs bridge returned invalid JSON")
+
+        if not isinstance(response, dict):
+            raise ToolError("invalid_response", "Emacs bridge response must be an object")
+
+        if response.get("id") != request_id:
+            raise ToolError("invalid_response", "Emacs bridge response id mismatch")
+
+        has_result = "result" in response
+        has_error = "error" in response
+        if has_result == has_error:
+            raise ToolError(
+                "invalid_response",
+                "Emacs bridge response must contain exactly one of result/error",
+            )
+
+        if has_error:
+            error_value = response["error"]
+            if isinstance(error_value, dict):
+                code = error_value.get("code")
+                message = error_value.get("message")
+                code_part = f"{code}" if code is not None else "unknown"
+                message_part = (
+                    str(message) if isinstance(message, str) and message else "Unknown error"
+                )
+            else:
+                code_part = "unknown"
+                message_part = "Malformed error payload"
+            raise ToolError("emacs_error", f"Emacs error {code_part}: {message_part}")
+
+        result = response.get("result")
+        if not isinstance(result, dict):
+            raise ToolError("invalid_response", "Emacs bridge result must be an object")
+        return result
+
+    def _readline_with_size_limit(self, client_socket: socket.socket, max_length: int) -> bytes:
+        data = bytearray()
+        while True:
+            chunk = client_socket.recv(4096)
+            if not chunk:
+                raise ToolError("invalid_response", "Emacs bridge closed without a newline response")
+            data.extend(chunk)
+            if len(data) > max_length:
+                raise ToolError("invalid_response", "Emacs bridge response exceeded size limit")
+            newline_index = data.find(b"\n")
+            if newline_index >= 0:
+                return bytes(data[:newline_index])
 
 
 class EmacsMcpServer:
@@ -299,6 +379,13 @@ class EmacsMcpServer:
         """Handle tools/call."""
         if not isinstance(params, dict):
             return _tool_err(request_id, "invalid_arguments", "Invalid params: expected object")
+        unknown_keys = sorted(set(params.keys()) - {"name", "arguments"})
+        if unknown_keys:
+            return _tool_err(
+                request_id,
+                "invalid_arguments",
+                f"Invalid params: unexpected keys: {', '.join(unknown_keys)}",
+            )
 
         tool_name = params.get("name")
         if not isinstance(tool_name, str) or not tool_name:
@@ -459,7 +546,7 @@ class EmacsMcpServer:
         return {"ok": True}
 
     def tool_get_selection(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
+        return self.emacs_client.call("emacs.get_selection", {})
 
     def tool_patch_init(self, arguments: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
