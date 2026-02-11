@@ -21,6 +21,15 @@ TOOL_SPECS = (
         },
     },
     {
+        "name": "emacs.get_project_root",
+        "description": "Get the project root path used by the MCP server.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "emacs.get_selection",
         "description": "Get current editor selection.",
         "inputSchema": {
@@ -30,34 +39,22 @@ TOOL_SPECS = (
         },
     },
     {
-        "name": "emacs.patch_init",
-        "description": "Initialize patch staging area.",
+        "name": "emacs.submit_diff",
+        "description": "Submit a small, single-file diff for review in Emacs.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "files": {"type": "array", "items": {"type": "string"}},
-                "create": {"type": "array", "items": {"type": "string"}},
-                "delete": {"type": "array", "items": {"type": "string"}},
+                "path": {"type": "string"},
+                "description": {"type": "string"},
+                "diff": {"type": "string"},
             },
+            "required": ["path", "description", "diff"],
             "additionalProperties": False,
         },
     },
     {
-        "name": "emacs.patch_add_files",
-        "description": "Add files to patch staging area.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "files": {"type": "array", "items": {"type": "string"}},
-                "create": {"type": "array", "items": {"type": "string"}},
-                "delete": {"type": "array", "items": {"type": "string"}},
-            },
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "emacs.patch_discard",
-        "description": "Discard current staged patch.",
+        "name": "emacs.feedback_list",
+        "description": "List unread per-file feedback items.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -65,21 +62,12 @@ TOOL_SPECS = (
         },
     },
     {
-        "name": "emacs.patch_submit_for_review",
-        "description": "Submit staged patch for review.",
+        "name": "emacs.feedback_get",
+        "description": "Get one unread feedback item and mark it consumed.",
         "inputSchema": {
             "type": "object",
-            "properties": {"description": {"type": "string"}},
-            "required": ["description"],
-            "additionalProperties": False,
-        },
-    },
-    {
-        "name": "emacs.wait_patch_result",
-        "description": "Wait for final patch review result.",
-        "inputSchema": {
-            "type": "object",
-            "properties": {},
+            "properties": {"id": {"type": "string"}},
+            "required": ["id"],
             "additionalProperties": False,
         },
     },
@@ -128,20 +116,13 @@ class ServerPaths:
     """Filesystem paths used by the server."""
 
     project_root: Path
-
-    stage_dir: Path
-
-    state_base_dir: Path
-
-    staging_state_dir: Path
-    staging_manifest_path: Path
-
-    review_state_dir: Path
-    review_manifest_path: Path
-    review_before_dir: Path
-
-    result_dir: Path
-    current_result_path: Path
+    state_dir: Path
+    active_dir: Path
+    active_index_path: Path
+    before_dir: Path
+    feedback_dir: Path
+    feedback_inbox_dir: Path
+    feedback_pending_dir: Path
 
     socket_path: Path
 
@@ -414,12 +395,11 @@ class EmacsMcpServer:
     ) -> dict[str, Any]:
         validators: dict[str, Any] = {
             "emacs.ping": self._validate_empty_arguments,
+            "emacs.get_project_root": self._validate_empty_arguments,
             "emacs.get_selection": self._validate_empty_arguments,
-            "emacs.patch_discard": self._validate_empty_arguments,
-            "emacs.wait_patch_result": self._validate_empty_arguments,
-            "emacs.patch_submit_for_review": self._validate_submit_arguments,
-            "emacs.patch_init": self._validate_patch_file_set_arguments,
-            "emacs.patch_add_files": self._validate_patch_file_set_arguments,
+            "emacs.feedback_list": self._validate_empty_arguments,
+            "emacs.submit_diff": self._validate_submit_diff_arguments,
+            "emacs.feedback_get": self._validate_feedback_get_arguments,
         }
         validator = validators.get(tool_name)
         assert validator is not None, f"Unhandled tool in validate_tool_arguments: {tool_name}"
@@ -431,37 +411,47 @@ class EmacsMcpServer:
         self._validate_no_keys(arguments, tool_name)
         return {}
 
-    def _validate_submit_arguments(
+    def _validate_submit_diff_arguments(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        self._validate_allowed_keys(arguments, {"description"}, tool_name)
+        self._validate_allowed_keys(arguments, {"path", "description", "diff"}, tool_name)
+        path = arguments.get("path")
         description = arguments.get("description")
+        diff = arguments.get("diff")
+
+        if not isinstance(path, str) or not path:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'path' must be a non-empty string",
+            )
+        self._resolve_repo_rel_path(path, tool_name, "path")
+
         if not isinstance(description, str) or not description:
             raise ToolError(
                 "invalid_arguments",
-                "Invalid arguments for emacs.patch_submit_for_review: "
-                "'description' must be a non-empty string",
+                f"Invalid arguments for {tool_name}: 'description' must be a non-empty string",
             )
-        return {"description": description}
 
-    def _validate_patch_file_set_arguments(
+        if not isinstance(diff, str) or not diff:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'diff' must be a non-empty string",
+            )
+
+        return {"path": path, "description": description, "diff": diff}
+
+    def _validate_feedback_get_arguments(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        self._validate_allowed_keys(arguments, {"files", "create", "delete"}, tool_name)
+        self._validate_allowed_keys(arguments, {"id"}, tool_name)
+        feedback_id = arguments.get("id")
+        if not isinstance(feedback_id, str) or not feedback_id:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'id' must be a non-empty string",
+            )
+        return {"id": feedback_id}
 
-        files = self._expect_string_list(arguments, "files")
-        create = self._expect_string_list(arguments, "create")
-        delete = self._expect_string_list(arguments, "delete")
-
-        for path in files:
-            self._validate_repo_rel_path_token(path, tool_name, "files")
-        for path in create:
-            self._validate_repo_rel_path_token(path, tool_name, "create")
-        for path in delete:
-            self._validate_repo_rel_path_token(path, tool_name, "delete")
-
-        self._ensure_no_duplicates(files, create, delete, tool_name)
-        return {"files": files, "create": create, "delete": delete}
 
     def _validate_no_keys(self, arguments: dict[str, Any], tool_name: str) -> None:
         if arguments:
@@ -481,21 +471,6 @@ class EmacsMcpServer:
                 "invalid_arguments",
                 f"Invalid arguments for {tool_name}: unexpected keys: {keys}",
             )
-
-    def _expect_string_list(self, arguments: dict[str, Any], key: str) -> list[str]:
-        value = arguments.get(key, [])
-        if not isinstance(value, list):
-            raise ToolError(
-                "invalid_arguments",
-                f"Invalid arguments: '{key}' must be a list of strings",
-            )
-        for item in value:
-            if not isinstance(item, str):
-                raise ToolError(
-                    "invalid_arguments",
-                    f"Invalid arguments: '{key}' must be a list of strings",
-                )
-        return value
 
     def _validate_repo_rel_path_token(self, path: str, tool_name: str, key: str) -> None:
         if not path:
@@ -520,22 +495,36 @@ class EmacsMcpServer:
                 f"Invalid arguments for {tool_name}: path traversal is not allowed: {path}",
             )
 
-    def _ensure_no_duplicates(
-        self, files: list[str], create: list[str], delete: list[str], tool_name: str
+    def _resolve_repo_rel_path(self, path: str, tool_name: str, key: str) -> Path:
+        self._validate_repo_rel_path_token(path, tool_name, key)
+        candidate = self.paths.project_root / path
+        resolved = Path(os.path.realpath(str(candidate)))
+        self._ensure_under_project_root(resolved, path, tool_name, key)
+        return resolved
+
+    def _ensure_under_project_root(
+        self, resolved_path: Path, input_path: str, tool_name: str, key: str
     ) -> None:
-        seen: set[str] = set()
-        for path in [*files, *create, *delete]:
-            if path in seen:
-                raise ToolError(
-                    "invalid_arguments",
-                    f"Invalid arguments for {tool_name}: duplicate path: {path}",
-                )
-            seen.add(path)
+        try:
+            resolved_path.relative_to(self.paths.project_root)
+        except ValueError:
+            raise ToolError(
+                "invalid_arguments",
+                (
+                    f"Invalid arguments for {tool_name}: '{key}' escapes project root: "
+                    f"{input_path}"
+                ),
+            )
 
     def dispatch_tool(self, ctx: ToolCallContext) -> dict[str, Any]:
         """Route tool calls to concrete handlers."""
         handlers: dict[str, Any] = {
             "emacs.ping": self.tool_ping,
+            "emacs.get_project_root": self.tool_get_project_root,
+            "emacs.get_selection": self.tool_get_selection,
+            "emacs.submit_diff": self.tool_submit_diff,
+            "emacs.feedback_list": self.tool_feedback_list,
+            "emacs.feedback_get": self.tool_feedback_get,
         }
         handler = handlers.get(ctx.tool_name)
         assert handler is not None, f"Unknown tool: {ctx.tool_name}"
@@ -545,23 +534,20 @@ class EmacsMcpServer:
     def tool_ping(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True}
 
+    def tool_get_project_root(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        return {"ok": True, "project_root": str(self.paths.project_root)}
+
     def tool_get_selection(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return self.emacs_client.call("emacs.get_selection", {})
 
-    def tool_patch_init(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
+    def tool_submit_diff(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raise ToolError("not_implemented", "emacs.submit_diff is not implemented yet")
 
-    def tool_patch_add_files(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
+    def tool_feedback_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raise ToolError("not_implemented", "emacs.feedback_list is not implemented yet")
 
-    def tool_patch_discard(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
-
-    def tool_patch_submit_for_review(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
-
-    def tool_wait_patch_result(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise NotImplementedError
+    def tool_feedback_get(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        raise ToolError("not_implemented", "emacs.feedback_get is not implemented yet")
 
 
 # Helpers
@@ -572,35 +558,29 @@ def build_paths() -> ServerPaths:
         return Path(os.path.realpath(str(path.expanduser())))
 
     project_root = _realpath(Path.cwd())
-    stage_dir = _realpath(Path("/tmp/emacs-mcp/stage"))
+    xdg_cache_home = _realpath(Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")))
+    cache_base_dir = _realpath(xdg_cache_home / "emacs-mcp")
 
-    xdg_cache_root = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache"))
-    state_base_dir = _realpath(xdg_cache_root / "emacs-mcp")
+    state_dir = _realpath(cache_base_dir / "state")
+    active_dir = _realpath(state_dir / "active")
+    active_index_path = _realpath(active_dir / "index.json")
+    before_dir = _realpath(active_dir / "before")
 
-    state_dir = _realpath(state_base_dir / "state")
-    staging_state_dir = _realpath(state_dir / "staging")
-    staging_manifest_path = _realpath(staging_state_dir / "manifest.json")
+    feedback_dir = _realpath(cache_base_dir / "feedback")
+    feedback_inbox_dir = _realpath(feedback_dir / "inbox")
+    feedback_pending_dir = _realpath(feedback_dir / "pending")
 
-    review_state_dir = _realpath(state_dir / "review")
-    review_manifest_path = _realpath(review_state_dir / "manifest.json")
-    review_before_dir = _realpath(review_state_dir / "before")
-
-    result_dir = _realpath(state_base_dir / "patch-results")
-    current_result_path = _realpath(result_dir / "current.json")
-
-    socket_path = _realpath(state_base_dir / "emacs-mcp.sock")
+    socket_path = _realpath(cache_base_dir / "emacs-mcp.sock")
 
     return ServerPaths(
         project_root=project_root,
-        stage_dir=stage_dir,
-        state_base_dir=state_base_dir,
-        staging_state_dir=staging_state_dir,
-        staging_manifest_path=staging_manifest_path,
-        review_state_dir=review_state_dir,
-        review_manifest_path=review_manifest_path,
-        review_before_dir=review_before_dir,
-        result_dir=result_dir,
-        current_result_path=current_result_path,
+        state_dir=state_dir,
+        active_dir=active_dir,
+        active_index_path=active_index_path,
+        before_dir=before_dir,
+        feedback_dir=feedback_dir,
+        feedback_inbox_dir=feedback_inbox_dir,
+        feedback_pending_dir=feedback_pending_dir,
         socket_path=socket_path,
     )
 
