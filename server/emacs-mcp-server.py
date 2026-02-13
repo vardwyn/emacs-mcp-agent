@@ -146,6 +146,15 @@ class ToolError(ServerError):
         self.message = message
 
 
+class PathValidationError(ServerError):
+    """Internal path validation error with a stable kind."""
+
+    def __init__(self, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+
+
 class EmacsRpcClient:
     """Unix-socket JSON bridge to Emacs."""
 
@@ -235,6 +244,8 @@ class EmacsRpcClient:
 
 class EmacsMcpServer:
     """Main MCP server implementation over stdio."""
+
+    ACTIVE_INDEX_SCHEMA_VERSION = 1
 
     def __init__(self, paths: ServerPaths, emacs_client: EmacsRpcClient) -> None:
         self.paths = paths
@@ -424,7 +435,7 @@ class EmacsMcpServer:
                 "invalid_arguments",
                 f"Invalid arguments for {tool_name}: 'path' must be a non-empty string",
             )
-        self._resolve_repo_rel_path(path, tool_name, "path")
+        self._validate_path_from_tool(path, tool_name, "path")
 
         if not isinstance(description, str) or not description:
             raise ToolError(
@@ -472,49 +483,196 @@ class EmacsMcpServer:
                 f"Invalid arguments for {tool_name}: unexpected keys: {keys}",
             )
 
-    def _validate_repo_rel_path_token(self, path: str, tool_name: str, key: str) -> None:
+    def _validate_repo_path(self, path: str) -> Path:
         if not path:
-            raise ToolError(
-                "invalid_arguments",
-                f"Invalid arguments for {tool_name}: '{key}' contains empty path",
-            )
+            raise PathValidationError("invalid_token", "contains empty path")
         if "\x00" in path:
-            raise ToolError(
-                "invalid_arguments",
-                f"Invalid arguments for {tool_name}: path contains NUL byte",
-            )
+            raise PathValidationError("invalid_token", "contains NUL byte")
         if os.path.isabs(path):
-            raise ToolError(
-                "invalid_arguments",
-                f"Invalid arguments for {tool_name}: path must be repo-relative: {path}",
-            )
-        path_obj = Path(path)
-        if ".." in path_obj.parts:
-            raise ToolError(
-                "invalid_arguments",
-                f"Invalid arguments for {tool_name}: path traversal is not allowed: {path}",
-            )
+            raise PathValidationError("invalid_token", "must be repo-relative")
+        if ".." in Path(path).parts:
+            raise PathValidationError("invalid_token", "path traversal is not allowed")
 
-    def _resolve_repo_rel_path(self, path: str, tool_name: str, key: str) -> Path:
-        self._validate_repo_rel_path_token(path, tool_name, key)
         candidate = self.paths.project_root / path
         resolved = Path(os.path.realpath(str(candidate)))
-        self._ensure_under_project_root(resolved, path, tool_name, key)
+        try:
+            resolved.relative_to(self.paths.project_root)
+        except ValueError:
+            raise PathValidationError("outside_project_root", "escapes project root")
         return resolved
 
-    def _ensure_under_project_root(
-        self, resolved_path: Path, input_path: str, tool_name: str, key: str
-    ) -> None:
+    def _validate_path_from_tool(self, path: str, tool_name: str, key: str) -> Path:
         try:
-            resolved_path.relative_to(self.paths.project_root)
-        except ValueError:
+            return self._validate_repo_path(path)
+        except PathValidationError as exc:
             raise ToolError(
                 "invalid_arguments",
+                f"Invalid arguments for {tool_name}: '{key}' {exc.message}: {path}",
+            )
+
+    def _validate_path_from_index(self, path: str) -> Path:
+        try:
+            return self._validate_repo_path(path)
+        except PathValidationError as exc:
+            raise ToolError("state_corrupt", f"Active index has invalid path: {path} ({exc.message})")
+
+    def _ensure_submit_state_dirs(self) -> None:
+        try:
+            self.paths.state_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.active_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.before_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to prepare state directories: {exc}")
+
+    def _load_active_index(self) -> dict[str, Any]:
+        if not self.paths.active_index_path.exists():
+            return {"schema_version": self.ACTIVE_INDEX_SCHEMA_VERSION, "active_files": {}}
+
+        try:
+            raw_text = self.paths.active_index_path.read_text(encoding="utf-8")
+            raw_value = json.loads(raw_text)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ToolError("state_corrupt", f"Failed to load active index: {exc}")
+
+        if not isinstance(raw_value, dict):
+            raise ToolError("state_corrupt", "Active index is not an object")
+
+        schema_version = raw_value.get("schema_version")
+        active_files = raw_value.get("active_files")
+        if schema_version != self.ACTIVE_INDEX_SCHEMA_VERSION:
+            raise ToolError(
+                "state_corrupt",
                 (
-                    f"Invalid arguments for {tool_name}: '{key}' escapes project root: "
-                    f"{input_path}"
+                    f"Unsupported active index schema: {schema_version}; "
+                    f"expected {self.ACTIVE_INDEX_SCHEMA_VERSION}"
                 ),
             )
+        if not isinstance(active_files, dict):
+            raise ToolError("state_corrupt", "Active index 'active_files' must be an object")
+
+        normalized_active_files: dict[str, dict[str, str]] = {}
+        for rel_path, meta in active_files.items():
+            if not isinstance(rel_path, str):
+                raise ToolError("state_corrupt", "Active index path key must be a string")
+            self._validate_path_from_index(rel_path)
+            if not isinstance(meta, dict):
+                raise ToolError("state_corrupt", f"Active index entry must be an object: {rel_path}")
+            before_kind = meta.get("before_kind")
+            if before_kind not in {"present", "missing"}:
+                raise ToolError(
+                    "state_corrupt",
+                    (
+                        f"Active index entry has invalid before_kind for {rel_path}: "
+                        f"{before_kind}"
+                    ),
+                )
+            normalized_active_files[rel_path] = {"before_kind": before_kind}
+
+        return {
+            "schema_version": self.ACTIVE_INDEX_SCHEMA_VERSION,
+            "active_files": normalized_active_files,
+        }
+
+    def _save_active_index(self, index: dict[str, Any]) -> None:
+        payload = json.dumps(index, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        self._atomic_write_text(self.paths.active_index_path, payload + "\n")
+
+    def _atomic_write_text(self, target_path: Path, payload: str) -> None:
+        temp_path = target_path.with_name(f".{target_path.name}.tmp-{os.getpid()}")
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path.write_text(payload, encoding="utf-8")
+            os.replace(temp_path, target_path)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to write state file {target_path}: {exc}")
+        finally:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+    def _before_snapshot_path(self, rel_path: str) -> Path:
+        return self.paths.before_dir / rel_path
+
+    def _is_file_active(self, rel_path: str, index: dict[str, Any]) -> bool:
+        active_files = index.get("active_files", {})
+        assert isinstance(active_files, dict), "active_files must be a dict"
+        return rel_path in active_files
+
+    def _create_before_snapshot_if_needed(
+        self, rel_path: str, abs_path: Path, index: dict[str, Any]
+    ) -> bool:
+        if self._is_file_active(rel_path, index):
+            return False
+
+        active_files = index["active_files"]
+        assert isinstance(active_files, dict), "active_files must be a dict"
+
+        before_snapshot_path = self._before_snapshot_path(rel_path)
+        try:
+            if abs_path.exists():
+                if not abs_path.is_file():
+                    raise ToolError(
+                        "invalid_arguments",
+                        f"Invalid path for emacs.submit_diff: not a regular file: {rel_path}",
+                    )
+                before_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                before_snapshot_path.write_bytes(abs_path.read_bytes())
+                active_files[rel_path] = {"before_kind": "present"}
+            else:
+                active_files[rel_path] = {"before_kind": "missing"}
+        except OSError as exc:
+            raise ToolError(
+                "io_error",
+                f"Failed to create BEFORE snapshot for {rel_path}: {exc}",
+            )
+        return True
+
+    def _normalize_submission_diff(self, rel_path: str, diff_text: str) -> str:
+        path_for_header = Path(rel_path).as_posix()
+        prelude_prefixes = (
+            "diff --git ",
+            "index ",
+            "--- ",
+            "+++ ",
+            "new file mode ",
+            "deleted file mode ",
+            "old mode ",
+            "new mode ",
+            "similarity index ",
+            "dissimilarity index ",
+            "rename from ",
+            "rename to ",
+            "Binary files ",
+        )
+
+        lines = diff_text.splitlines()
+        body_lines: list[str] = []
+        in_body = False
+        for line in lines:
+            if not in_body:
+                if line.startswith("@@ "):
+                    in_body = True
+                    body_lines.append(line)
+                    continue
+                if line.startswith(prelude_prefixes) or line == "":
+                    continue
+                in_body = True
+                body_lines.append(line)
+                continue
+            body_lines.append(line)
+
+        if not body_lines:
+            body_lines = lines
+
+        canonical_header = [
+            f"diff --git a/{path_for_header} b/{path_for_header}",
+            f"--- a/{path_for_header}",
+            f"+++ b/{path_for_header}",
+        ]
+        normalized_lines = canonical_header + body_lines
+        return "\n".join(normalized_lines).rstrip("\n") + "\n"
 
     def dispatch_tool(self, ctx: ToolCallContext) -> dict[str, Any]:
         """Route tool calls to concrete handlers."""
@@ -541,7 +699,27 @@ class EmacsMcpServer:
         return self.emacs_client.call("emacs.get_selection", {})
 
     def tool_submit_diff(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise ToolError("not_implemented", "emacs.submit_diff is not implemented yet")
+        path = arguments.get("path")
+        description = arguments.get("description")
+        diff = arguments.get("diff")
+        assert isinstance(path, str), "Validated argument 'path' must be a string"
+        assert isinstance(description, str), "Validated argument 'description' must be a string"
+        assert isinstance(diff, str), "Validated argument 'diff' must be a string"
+
+        abs_path = self._validate_path_from_tool(path, "emacs.submit_diff", "path")
+        self._ensure_submit_state_dirs()
+        active_index = self._load_active_index()
+        created_active_entry = self._create_before_snapshot_if_needed(path, abs_path, active_index)
+
+        normalized_diff = self._normalize_submission_diff(path, diff)
+        self.emacs_client.call(
+            "emacs.append_submission",
+            {"path": path, "description": description, "diff": normalized_diff},
+        )
+
+        if created_active_entry:
+            self._save_active_index(active_index)
+        return {"ok": True}
 
     def tool_feedback_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         raise ToolError("not_implemented", "emacs.feedback_list is not implemented yet")
