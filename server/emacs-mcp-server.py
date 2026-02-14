@@ -6,6 +6,7 @@ import os
 import socket
 import sys
 import difflib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,11 @@ MCP_PROTOCOL_VERSION = "2025-11-25"
 BRIDGE_CONNECT_TIMEOUT_S = 1.0
 BRIDGE_READ_TIMEOUT_S = 5.0
 BRIDGE_MAX_LINE_BYTES = 1024 * 1024
+MCP_MAX_REQUEST_LINE_BYTES = 1024 * 1024
+SUBMIT_MAX_DIFF_BYTES = 256 * 1024
+SUBMIT_MAX_DESCRIPTION_BYTES = 16 * 1024
+SELECTION_MAX_TEXT_BYTES = 256 * 1024
+SELECTION_MAX_FILE_BYTES = 16 * 1024
 
 
 # JSON response templates
@@ -110,6 +116,10 @@ def _tool_err(request_id: Any, code: str, message: str) -> dict[str, Any]:
             "structuredContent": {"error": {"code": code, "message": message}},
         },
     )
+
+
+def _utf8_len(value: str) -> int:
+    return len(value.encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -199,6 +209,10 @@ class EmacsRpcClient:
         if not isinstance(response, dict):
             raise ToolError("invalid_response", "Emacs bridge response must be an object")
 
+        jsonrpc = response.get("jsonrpc")
+        if jsonrpc is not None and jsonrpc != "2.0":
+            raise ToolError("invalid_response", "Emacs bridge response has invalid jsonrpc version")
+
         if response.get("id") != request_id:
             raise ToolError("invalid_response", "Emacs bridge response id mismatch")
 
@@ -252,20 +266,33 @@ class EmacsMcpServer:
         self.paths = paths
         self.emacs_client = emacs_client
         self.is_initialized = False
+        self._ensure_private_dir(self.paths.socket_path.parent)
 
     def run(self) -> int:
         """Read MCP requests from stdin and write responses to stdout."""
-        for raw_line in sys.stdin:
-            line = raw_line.strip()
+        while True:
+            raw_line = sys.stdin.buffer.readline(MCP_MAX_REQUEST_LINE_BYTES + 1)
+            if not raw_line:
+                break
+
+            if len(raw_line) > MCP_MAX_REQUEST_LINE_BYTES:
+                self._write_response(_rpc_error(None, -32600, "Invalid Request: request line too large"))
+                return 1
+
+            try:
+                line = raw_line.decode("utf-8")
+            except UnicodeDecodeError:
+                self._write_response(_rpc_error(None, -32700, "Parse error"))
+                continue
+
+            line = line.strip()
             if not line:
                 continue
 
             try:
                 request = json.loads(line)
             except json.JSONDecodeError:
-                response = _rpc_error(None, -32700, "Parse error")
-                sys.stdout.write(json.dumps(response) + "\n")
-                sys.stdout.flush()
+                self._write_response(_rpc_error(None, -32700, "Parse error"))
                 continue
 
             try:
@@ -278,10 +305,13 @@ class EmacsMcpServer:
             if response is None:
                 continue
 
-            sys.stdout.write(json.dumps(response) + "\n")
-            sys.stdout.flush()
+            self._write_response(response)
 
         return 0
+
+    def _write_response(self, response: dict[str, Any]) -> None:
+        sys.stdout.write(json.dumps(response) + "\n")
+        sys.stdout.flush()
 
     def handle_rpc_request(self, request: dict[str, Any]) -> dict[str, Any] | None:
         """Dispatch a single JSON-RPC request."""
@@ -443,11 +473,27 @@ class EmacsMcpServer:
                 "invalid_arguments",
                 f"Invalid arguments for {tool_name}: 'description' must be a non-empty string",
             )
+        if _utf8_len(description) > SUBMIT_MAX_DESCRIPTION_BYTES:
+            raise ToolError(
+                "invalid_arguments",
+                (
+                    f"Invalid arguments for {tool_name}: 'description' is too large "
+                    f"(max {SUBMIT_MAX_DESCRIPTION_BYTES} bytes)"
+                ),
+            )
 
         if not isinstance(diff, str) or not diff:
             raise ToolError(
                 "invalid_arguments",
                 f"Invalid arguments for {tool_name}: 'diff' must be a non-empty string",
+            )
+        if _utf8_len(diff) > SUBMIT_MAX_DIFF_BYTES:
+            raise ToolError(
+                "invalid_arguments",
+                (
+                    f"Invalid arguments for {tool_name}: 'diff' is too large "
+                    f"(max {SUBMIT_MAX_DIFF_BYTES} bytes)"
+                ),
             )
 
         return {"path": path, "description": description, "diff": diff}
@@ -469,6 +515,92 @@ class EmacsMcpServer:
                 f"Invalid arguments for {tool_name}: 'id' must be a positive integer",
             )
         return {"id": feedback_id}
+
+    def _validate_selection_point(self, key: str, value: Any) -> dict[str, int]:
+        if not isinstance(value, dict):
+            raise ToolError("invalid_response", f"Invalid emacs.get_selection '{key}': expected object")
+        unknown_keys = sorted(set(value.keys()) - {"line", "col", "pos"})
+        if unknown_keys:
+            raise ToolError(
+                "invalid_response",
+                f"Invalid emacs.get_selection '{key}': unexpected keys: {', '.join(unknown_keys)}",
+            )
+
+        line = value.get("line")
+        col = value.get("col")
+        pos = value.get("pos")
+        if not isinstance(line, int) or isinstance(line, bool) or line < 0:
+            raise ToolError("invalid_response", f"Invalid emacs.get_selection '{key}.line'")
+        if not isinstance(col, int) or isinstance(col, bool) or col < 0:
+            raise ToolError("invalid_response", f"Invalid emacs.get_selection '{key}.col'")
+        if not isinstance(pos, int) or isinstance(pos, bool) or pos < 0:
+            raise ToolError("invalid_response", f"Invalid emacs.get_selection '{key}.pos'")
+        return {"line": line, "col": col, "pos": pos}
+
+    def _validate_get_selection_result(self, result: dict[str, Any]) -> dict[str, Any]:
+        ok = result.get("ok")
+        if not isinstance(ok, bool):
+            raise ToolError("invalid_response", "Invalid emacs.get_selection result: missing boolean 'ok'")
+
+        if ok:
+            unknown_keys = sorted(set(result.keys()) - {"ok", "file", "start", "end", "text"})
+            if unknown_keys:
+                raise ToolError(
+                    "invalid_response",
+                    (
+                        "Invalid emacs.get_selection result: unexpected keys: "
+                        f"{', '.join(unknown_keys)}"
+                    ),
+                )
+
+            file_path = result.get("file")
+            text = result.get("text")
+            if not isinstance(file_path, str) or not file_path:
+                raise ToolError("invalid_response", "Invalid emacs.get_selection result: invalid 'file'")
+            if _utf8_len(file_path) > SELECTION_MAX_FILE_BYTES:
+                raise ToolError(
+                    "invalid_response",
+                    (
+                        "Invalid emacs.get_selection result: 'file' is too large "
+                        f"(max {SELECTION_MAX_FILE_BYTES} bytes)"
+                    ),
+                )
+            try:
+                self._validate_repo_path(file_path)
+            except PathValidationError as exc:
+                raise ToolError(
+                    "invalid_response",
+                    f"Invalid emacs.get_selection result: invalid 'file' path ({exc.message})",
+                )
+
+            if not isinstance(text, str):
+                raise ToolError("invalid_response", "Invalid emacs.get_selection result: invalid 'text'")
+            if _utf8_len(text) > SELECTION_MAX_TEXT_BYTES:
+                raise ToolError(
+                    "invalid_response",
+                    (
+                        "Invalid emacs.get_selection result: 'text' is too large "
+                        f"(max {SELECTION_MAX_TEXT_BYTES} bytes)"
+                    ),
+                )
+
+            start = self._validate_selection_point("start", result.get("start"))
+            end = self._validate_selection_point("end", result.get("end"))
+            return {"ok": True, "file": file_path, "start": start, "end": end, "text": text}
+
+        unknown_keys = sorted(set(result.keys()) - {"ok", "reason"})
+        if unknown_keys:
+            raise ToolError(
+                "invalid_response",
+                (
+                    "Invalid emacs.get_selection result: unexpected keys: "
+                    f"{', '.join(unknown_keys)}"
+                ),
+            )
+        reason = result.get("reason")
+        if not isinstance(reason, str) or not reason:
+            raise ToolError("invalid_response", "Invalid emacs.get_selection result: invalid 'reason'")
+        return {"ok": False, "reason": reason}
 
 
     def _validate_no_keys(self, arguments: dict[str, Any], tool_name: str) -> None:
@@ -523,21 +655,43 @@ class EmacsMcpServer:
         except PathValidationError as exc:
             raise ToolError("state_corrupt", f"Active index has invalid path: {path} ({exc.message})")
 
-    def _ensure_submit_state_dirs(self) -> None:
+    def _ensure_private_dir(self, path: Path) -> None:
         try:
-            self.paths.state_dir.mkdir(parents=True, exist_ok=True)
-            self.paths.active_dir.mkdir(parents=True, exist_ok=True)
-            self.paths.before_dir.mkdir(parents=True, exist_ok=True)
+            path.mkdir(parents=True, exist_ok=True)
+            os.chmod(path, 0o700)
         except OSError as exc:
-            raise ToolError("io_error", f"Failed to prepare state directories: {exc}")
+            raise ToolError("io_error", f"Failed to prepare private directory {path}: {exc}")
+
+    def _set_private_file_mode(self, path: Path) -> None:
+        try:
+            os.chmod(path, 0o600)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to set private file mode for {path}: {exc}")
+
+    def _fsync_parent_dir(self, target_path: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        try:
+            dir_fd = os.open(str(target_path.parent), flags)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to open directory for sync {target_path.parent}: {exc}")
+        try:
+            os.fsync(dir_fd)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to sync directory {target_path.parent}: {exc}")
+        finally:
+            os.close(dir_fd)
+
+    def _ensure_submit_state_dirs(self) -> None:
+        self._ensure_private_dir(self.paths.state_dir)
+        self._ensure_private_dir(self.paths.active_dir)
+        self._ensure_private_dir(self.paths.before_dir)
 
     def _ensure_feedback_dirs(self) -> None:
-        try:
-            self.paths.feedback_dir.mkdir(parents=True, exist_ok=True)
-            self.paths.feedback_inbox_dir.mkdir(parents=True, exist_ok=True)
-            self.paths.feedback_pending_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            raise ToolError("io_error", f"Failed to prepare feedback directories: {exc}")
+        self._ensure_private_dir(self.paths.feedback_dir)
+        self._ensure_private_dir(self.paths.feedback_inbox_dir)
+        self._ensure_private_dir(self.paths.feedback_pending_dir)
 
     def _load_active_index(self) -> dict[str, Any]:
         if not self.paths.active_index_path.exists():
@@ -591,20 +745,41 @@ class EmacsMcpServer:
     def _save_active_index(self, index: dict[str, Any]) -> None:
         self._write_json_atomic(self.paths.active_index_path, index)
 
-    def _atomic_write_text(self, target_path: Path, payload: str) -> None:
-        temp_path = target_path.with_name(f".{target_path.name}.tmp-{os.getpid()}")
+    def _atomic_write_bytes(self, target_path: Path, payload: bytes) -> None:
+        self._ensure_private_dir(target_path.parent)
+        temp_fd = -1
+        temp_path: Path | None = None
         try:
-            target_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path.write_text(payload, encoding="utf-8")
+            temp_fd, temp_name = tempfile.mkstemp(
+                prefix=f".{target_path.name}.tmp-",
+                dir=str(target_path.parent),
+            )
+            temp_path = Path(temp_name)
+            os.chmod(temp_path, 0o600)
+            with os.fdopen(temp_fd, "wb") as temp_file:
+                temp_fd = -1
+                temp_file.write(payload)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
             os.replace(temp_path, target_path)
+            self._set_private_file_mode(target_path)
+            self._fsync_parent_dir(target_path)
         except OSError as exc:
             raise ToolError("io_error", f"Failed to write state file {target_path}: {exc}")
         finally:
-            if temp_path.exists():
+            if temp_fd >= 0:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
+            if temp_path is not None and temp_path.exists():
                 try:
                     temp_path.unlink()
                 except OSError:
                     pass
+
+    def _atomic_write_text(self, target_path: Path, payload: str) -> None:
+        self._atomic_write_bytes(target_path, payload.encode("utf-8"))
 
     def _write_json_atomic(self, target_path: Path, payload: dict[str, Any]) -> None:
         body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
@@ -635,8 +810,7 @@ class EmacsMcpServer:
                         "invalid_arguments",
                         f"Invalid path for emacs.submit_diff: not a regular file: {rel_path}",
                     )
-                before_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                before_snapshot_path.write_bytes(abs_path.read_bytes())
+                self._atomic_write_bytes(before_snapshot_path, abs_path.read_bytes())
                 active_files[rel_path] = {"before_kind": "present"}
             else:
                 active_files[rel_path] = {"before_kind": "missing"}
@@ -992,7 +1166,8 @@ class EmacsMcpServer:
         return {"ok": True, "project_root": str(self.paths.project_root)}
 
     def tool_get_selection(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return self.emacs_client.call("emacs.get_selection", {})
+        selection = self.emacs_client.call("emacs.get_selection", {})
+        return self._validate_get_selection_result(selection)
 
     def tool_submit_diff(self, arguments: dict[str, Any]) -> dict[str, Any]:
         path = arguments.get("path")
