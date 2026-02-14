@@ -5,6 +5,7 @@ import json
 import os
 import socket
 import sys
+import difflib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,7 +67,7 @@ TOOL_SPECS = (
         "description": "Get one unread feedback item and mark it consumed.",
         "inputSchema": {
             "type": "object",
-            "properties": {"id": {"type": "string"}},
+            "properties": {"id": {"type": "integer"}},
             "required": ["id"],
             "additionalProperties": False,
         },
@@ -456,10 +457,16 @@ class EmacsMcpServer:
     ) -> dict[str, Any]:
         self._validate_allowed_keys(arguments, {"id"}, tool_name)
         feedback_id = arguments.get("id")
-        if not isinstance(feedback_id, str) or not feedback_id:
+        if not isinstance(feedback_id, int) or isinstance(feedback_id, bool):
+            # bool is a subclass of int in python!!
             raise ToolError(
                 "invalid_arguments",
-                f"Invalid arguments for {tool_name}: 'id' must be a non-empty string",
+                f"Invalid arguments for {tool_name}: 'id' must be an integer",
+            )
+        if feedback_id <= 0:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'id' must be a positive integer",
             )
         return {"id": feedback_id}
 
@@ -524,6 +531,14 @@ class EmacsMcpServer:
         except OSError as exc:
             raise ToolError("io_error", f"Failed to prepare state directories: {exc}")
 
+    def _ensure_feedback_dirs(self) -> None:
+        try:
+            self.paths.feedback_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.feedback_inbox_dir.mkdir(parents=True, exist_ok=True)
+            self.paths.feedback_pending_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to prepare feedback directories: {exc}")
+
     def _load_active_index(self) -> dict[str, Any]:
         if not self.paths.active_index_path.exists():
             return {"schema_version": self.ACTIVE_INDEX_SCHEMA_VERSION, "active_files": {}}
@@ -574,8 +589,7 @@ class EmacsMcpServer:
         }
 
     def _save_active_index(self, index: dict[str, Any]) -> None:
-        payload = json.dumps(index, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
-        self._atomic_write_text(self.paths.active_index_path, payload + "\n")
+        self._write_json_atomic(self.paths.active_index_path, index)
 
     def _atomic_write_text(self, target_path: Path, payload: str) -> None:
         temp_path = target_path.with_name(f".{target_path.name}.tmp-{os.getpid()}")
@@ -591,6 +605,10 @@ class EmacsMcpServer:
                     temp_path.unlink()
                 except OSError:
                     pass
+
+    def _write_json_atomic(self, target_path: Path, payload: dict[str, Any]) -> None:
+        body = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n"
+        self._atomic_write_text(target_path, body)
 
     def _before_snapshot_path(self, rel_path: str) -> Path:
         return self.paths.before_dir / rel_path
@@ -628,6 +646,284 @@ class EmacsMcpServer:
                 f"Failed to create BEFORE snapshot for {rel_path}: {exc}",
             )
         return True
+
+    def _clear_active_file(self, rel_path: str, index: dict[str, Any]) -> None:
+        active_files = index.get("active_files", {})
+        assert isinstance(active_files, dict), "active_files must be a dict"
+        active_files.pop(rel_path, None)
+
+        before_snapshot_path = self._before_snapshot_path(rel_path)
+        try:
+            if before_snapshot_path.exists():
+                before_snapshot_path.unlink()
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to remove BEFORE snapshot for {rel_path}: {exc}")
+
+        parent = before_snapshot_path.parent
+        while parent != self.paths.before_dir and parent.exists():
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+
+    def _read_text_file(self, path: Path) -> str:
+        try:
+            return path.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to read file {path}: {exc}")
+
+    def _read_before_state(self, rel_path: str, before_kind: str) -> tuple[str, bool]:
+        if before_kind == "missing":
+            return ("", False)
+        before_snapshot_path = self._before_snapshot_path(rel_path)
+        if not before_snapshot_path.exists():
+            raise ToolError(
+                "state_corrupt",
+                f"Missing BEFORE snapshot for active file: {rel_path}",
+            )
+        if not before_snapshot_path.is_file():
+            raise ToolError(
+                "state_corrupt",
+                f"BEFORE snapshot is not a file: {before_snapshot_path}",
+            )
+        return (self._read_text_file(before_snapshot_path), True)
+
+    def _read_after_state(self, abs_path: Path, rel_path: str) -> tuple[str, bool]:
+        if not abs_path.exists():
+            return ("", False)
+        if not abs_path.is_file():
+            raise ToolError(
+                "state_corrupt",
+                f"Current file path is not a regular file: {rel_path}",
+            )
+        return (self._read_text_file(abs_path), True)
+
+    def _generate_applied_diff(
+        self,
+        rel_path: str,
+        before_text: str,
+        before_exists: bool,
+        after_text: str,
+        after_exists: bool,
+    ) -> str:
+        if before_exists == after_exists and before_text == after_text:
+            return ""
+
+        path_for_header = Path(rel_path).as_posix()
+        fromfile = f"a/{path_for_header}" if before_exists else "/dev/null"
+        tofile = f"b/{path_for_header}" if after_exists else "/dev/null"
+
+        body_lines = list(
+            difflib.unified_diff(
+                before_text.splitlines(keepends=True),
+                after_text.splitlines(keepends=True),
+                fromfile=fromfile,
+                tofile=tofile,
+                lineterm="",
+            )
+        )
+        if not body_lines:
+            return ""
+
+        header = f"diff --git a/{path_for_header} b/{path_for_header}\n"
+        return header + "\n".join(body_lines).rstrip("\n") + "\n"
+
+    def _feedback_next_id_path(self) -> Path:
+        return self.paths.feedback_dir / "next_id.txt"
+
+    def _allocate_feedback_id(self) -> int:
+        next_id_path = self._feedback_next_id_path()
+        next_id_value = 1
+
+        if next_id_path.exists():
+            try:
+                raw_text = next_id_path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise ToolError("io_error", f"Failed to read feedback ID state: {exc}")
+            try:
+                next_id_value = int(raw_text)
+            except ValueError:
+                raise ToolError("state_corrupt", f"Invalid feedback ID state value: {raw_text!r}")
+            if not isinstance(next_id_value, int) or next_id_value <= 0:
+                raise ToolError(
+                    "state_corrupt",
+                    f"Invalid feedback next ID value: {next_id_value}",
+                )
+        else:
+            max_pending_id = 0
+            for pending_path in self._list_pending_paths():
+                pending_id = int(pending_path.stem)
+                if pending_id > max_pending_id:
+                    max_pending_id = pending_id
+            next_id_value = max_pending_id + 1
+            if not isinstance(next_id_value, int) or next_id_value <= 0:
+                raise ToolError(
+                    "state_corrupt",
+                    f"Invalid computed feedback next ID: {next_id_value}",
+                )
+
+        allocated_id = next_id_value
+        self._atomic_write_text(next_id_path, f"{allocated_id + 1}\n")
+        return allocated_id
+
+    def _pending_item_path(self, feedback_id: int) -> Path:
+        assert isinstance(feedback_id, int) and not isinstance(feedback_id, bool) and feedback_id > 0, (
+            "feedback id must be a positive integer"
+        )
+        return self.paths.feedback_pending_dir / f"{feedback_id}.json"
+
+    def _load_finalize_event(self, inbox_path: Path) -> dict[str, Any]:
+        try:
+            raw_text = inbox_path.read_text(encoding="utf-8")
+            raw_value = json.loads(raw_text)
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to read feedback inbox event {inbox_path}: {exc}")
+        except json.JSONDecodeError as exc:
+            raise ToolError("state_corrupt", f"Invalid JSON in feedback inbox event {inbox_path}: {exc}")
+        if not isinstance(raw_value, dict):
+            raise ToolError("state_corrupt", f"Feedback inbox event is not an object: {inbox_path}")
+        return raw_value
+
+    def _extract_finalize_event(self, inbox_path: Path) -> tuple[str, str]:
+        event = self._load_finalize_event(inbox_path)
+
+        schema_version = event.get("schema_version")
+        if schema_version != 1:
+            raise ToolError(
+                "state_corrupt",
+                f"Unsupported feedback inbox event schema in {inbox_path}: {schema_version}",
+            )
+
+        rel_path = event.get("path")
+        if not isinstance(rel_path, str) or not rel_path:
+            raise ToolError("state_corrupt", f"Invalid feedback inbox event path in {inbox_path}")
+
+        user_message = event.get("user_message", "")
+        if user_message is None:
+            user_message = ""
+        if not isinstance(user_message, str):
+            raise ToolError(
+                "state_corrupt",
+                f"Invalid feedback inbox event user_message in {inbox_path}",
+            )
+        return (rel_path, user_message)
+
+    def _process_feedback_inbox(self) -> None:
+        self._ensure_feedback_dirs()
+        self._ensure_submit_state_dirs()
+
+        active_index = self._load_active_index()
+        index_changed = False
+
+        inbox_files = sorted(
+            path
+            for path in self.paths.feedback_inbox_dir.iterdir()
+            if path.is_file() and path.suffix == ".json"
+        )
+        for inbox_path in inbox_files:
+            rel_path, user_message = self._extract_finalize_event(inbox_path)
+            abs_path = self._validate_path_from_index(rel_path)
+
+            applied_diff = ""
+            active_files = active_index.get("active_files", {})
+            assert isinstance(active_files, dict), "active_files must be a dict"
+            active_entry = active_files.get(rel_path)
+            if isinstance(active_entry, dict):
+                before_kind = active_entry.get("before_kind")
+                if before_kind not in {"present", "missing"}:
+                    raise ToolError(
+                        "state_corrupt",
+                        f"Active index entry has invalid before_kind for {rel_path}: {before_kind}",
+                    )
+                before_text, before_exists = self._read_before_state(rel_path, before_kind)
+                after_text, after_exists = self._read_after_state(abs_path, rel_path)
+                applied_diff = self._generate_applied_diff(
+                    rel_path=rel_path,
+                    before_text=before_text,
+                    before_exists=before_exists,
+                    after_text=after_text,
+                    after_exists=after_exists,
+                )
+                self._clear_active_file(rel_path, active_index)
+                index_changed = True
+
+            feedback_id = self._allocate_feedback_id()
+            pending_item = {
+                "schema_version": 1,
+                "id": feedback_id,
+                "path": rel_path,
+                "applied_diff": applied_diff,
+                "user_message": user_message,
+            }
+            self._write_json_atomic(self._pending_item_path(feedback_id), pending_item)
+
+            try:
+                inbox_path.unlink()
+            except OSError as exc:
+                raise ToolError(
+                    "io_error",
+                    f"Failed to delete processed feedback inbox event {inbox_path}: {exc}",
+                )
+
+        if index_changed:
+            self._save_active_index(active_index)
+
+    def _load_pending_item(self, pending_path: Path) -> dict[str, Any]:
+        try:
+            raw_text = pending_path.read_text(encoding="utf-8")
+            raw_value = json.loads(raw_text)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ToolError("state_corrupt", f"Invalid pending feedback file {pending_path}: {exc}")
+
+        if not isinstance(raw_value, dict):
+            raise ToolError("state_corrupt", f"Pending feedback is not an object: {pending_path}")
+        if raw_value.get("schema_version") != 1:
+            raise ToolError(
+                "state_corrupt",
+                f"Unsupported pending feedback schema in {pending_path}",
+            )
+
+        feedback_id = raw_value.get("id")
+        rel_path = raw_value.get("path")
+        applied_diff = raw_value.get("applied_diff")
+        user_message = raw_value.get("user_message")
+        if (
+            not isinstance(feedback_id, int)
+            or isinstance(feedback_id, bool)
+            or feedback_id <= 0
+        ):
+            raise ToolError("state_corrupt", f"Invalid feedback id in {pending_path}")
+        if not isinstance(rel_path, str):
+            raise ToolError("state_corrupt", f"Invalid feedback path in {pending_path}")
+        self._validate_path_from_index(rel_path)
+        if not isinstance(applied_diff, str):
+            raise ToolError("state_corrupt", f"Invalid applied_diff in {pending_path}")
+        if user_message is None:
+            user_message = ""
+        if not isinstance(user_message, str):
+            raise ToolError("state_corrupt", f"Invalid user_message in {pending_path}")
+
+        return {
+            "schema_version": 1,
+            "id": feedback_id,
+            "path": rel_path,
+            "applied_diff": applied_diff,
+            "user_message": user_message,
+        }
+
+    def _list_pending_paths(self) -> list[Path]:
+        self._ensure_feedback_dirs()
+        pending_paths = [
+            path
+            for path in self.paths.feedback_pending_dir.iterdir()
+            if path.is_file() and path.suffix == ".json"
+        ]
+        for path in pending_paths:
+            assert path.stem.isdigit() and int(path.stem) > 0, (
+                f"Pending feedback filename must be a positive integer id: {path.name}"
+            )
+        return sorted(pending_paths, key=lambda path: int(path.stem))
 
     def _normalize_submission_diff(self, rel_path: str, diff_text: str) -> str:
         path_for_header = Path(rel_path).as_posix()
@@ -722,10 +1018,34 @@ class EmacsMcpServer:
         return {"ok": True}
 
     def tool_feedback_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise ToolError("not_implemented", "emacs.feedback_list is not implemented yet")
+        self._process_feedback_inbox()
+        items: list[dict[str, Any]] = []
+        for pending_path in self._list_pending_paths():
+            item = self._load_pending_item(pending_path)
+            items.append({"id": item["id"], "path": item["path"]})
+        return {"ok": True, "items": items}
 
     def tool_feedback_get(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        raise ToolError("not_implemented", "emacs.feedback_get is not implemented yet")
+        feedback_id = arguments.get("id")
+        assert isinstance(feedback_id, int) and not isinstance(feedback_id, bool), (
+            "Validated argument 'id' must be an integer"
+        )
+
+        self._process_feedback_inbox()
+        pending_path = self._pending_item_path(feedback_id)
+        if not pending_path.exists():
+            raise ToolError("not_found", f"Feedback item not found: {feedback_id}")
+        item = self._load_pending_item(pending_path)
+        try:
+            pending_path.unlink()
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to consume feedback item {feedback_id}: {exc}")
+        return {
+            "ok": True,
+            "path": item["path"],
+            "applied_diff": item["applied_diff"],
+            "user_message": item["user_message"],
+        }
 
 
 # Helpers
