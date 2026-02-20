@@ -268,41 +268,50 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--socket-filter (process chunk)
   "Socket filter for incoming CHUNK from PROCESS."
-  (let* ((conn (or (gethash process emacs-mcp--connections)
-                   (progn
-                     (emacs-mcp--register-client process)
-                     (gethash process emacs-mcp--connections))))
-         (partial (or (emacs-mcp-connection-partial-input conn) ""))
-         (buffer (concat partial chunk))
-         (start 0)
-         newline-index
-         (drop-client nil))
-    (while (and (not drop-client)
-                (setq newline-index (string-match "\n" buffer start)))
-      (let ((line (substring buffer start newline-index)))
-        (when (> (string-bytes line) emacs-mcp-max-request-line-bytes)
-          (emacs-mcp--server-log "Dropping client: oversized request line")
-          (emacs-mcp--send-response
-           process
-           (emacs-mcp--rpc-error nil "invalid_request" "Request line exceeds size limit"))
-          (setq drop-client t))
+  (if-let* ((conn (gethash process emacs-mcp--connections)))
+      (let ((partial (or (emacs-mcp-connection-partial-input conn) ""))
+            (start 0)
+            newline-index
+            (drop-client nil))
+        (while (and (not drop-client)
+                    (setq newline-index (string-match "\n" chunk start)))
+          (let* ((segment (substring chunk start newline-index))
+                 (line-bytes (+ (string-bytes partial) (string-bytes segment))))
+            (when (> line-bytes emacs-mcp-max-request-line-bytes)
+              (emacs-mcp--server-log "Dropping client: oversized request line")
+              (emacs-mcp--send-response
+               process
+               (emacs-mcp--rpc-error nil "invalid_request" "Request line exceeds size limit"))
+              (setq drop-client t))
+            (unless drop-client
+              (let ((line (if (string-empty-p partial)
+                              segment
+                            (concat partial segment))))
+                (setq partial "")
+                (condition-case err
+                    (emacs-mcp--rpc-handle-line process line)
+                  (error
+                   (emacs-mcp--server-log "Failed to handle socket line: %s" err))))))
+          (setq start (1+ newline-index)))
         (unless drop-client
-          (condition-case err
-              (emacs-mcp--rpc-handle-line process line)
-            (error
-             (emacs-mcp--server-log "Failed to handle socket line: %s" err)))))
-      (setq start (1+ newline-index)))
-    (if drop-client
-        (emacs-mcp--close-client process)
-      (setf (emacs-mcp-connection-partial-input conn)
-            (substring buffer start))
-      (when (> (string-bytes (emacs-mcp-connection-partial-input conn))
-               emacs-mcp-max-request-line-bytes)
-        (emacs-mcp--server-log "Dropping client: partial line exceeds size limit")
-        (emacs-mcp--send-response
-         process
-         (emacs-mcp--rpc-error nil "invalid_request" "Request line exceeds size limit"))
-        (emacs-mcp--close-client process)))))
+          (let* ((tail (substring chunk start))
+                 (tail-bytes (+ (string-bytes partial) (string-bytes tail))))
+            (if (> tail-bytes emacs-mcp-max-request-line-bytes)
+                (progn
+                  (emacs-mcp--server-log "Dropping client: partial line exceeds size limit")
+                  (emacs-mcp--send-response
+                   process
+                   (emacs-mcp--rpc-error nil "invalid_request" "Request line exceeds size limit"))
+                  (setq drop-client t))
+              (setq partial
+                    (if (string-empty-p partial)
+                        tail
+                      (concat partial tail))))))
+        (if drop-client
+            (emacs-mcp--close-client process)
+          (setf (emacs-mcp-connection-partial-input conn) partial)))
+    (emacs-mcp--server-log "Dropping untracked client in socket filter")
+    (emacs-mcp--close-client process)))
 
 (defun emacs-mcp--socket-sentinel (process event)
   "Socket sentinel for PROCESS with EVENT."
