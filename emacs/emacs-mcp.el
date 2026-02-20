@@ -26,6 +26,14 @@ When nil, use `default-directory'."
   "Schema version written to feedback inbox event files."
   :type 'integer)
 
+(defcustom emacs-mcp-max-request-line-bytes (* 1024 1024)
+  "Maximum bytes allowed for one incoming socket JSON line."
+  :type 'integer)
+
+(defcustom emacs-mcp-max-selection-bytes (* 256 1024)
+  "Maximum UTF-8 byte size returned by `emacs.get_selection` text payload."
+  :type 'integer)
+
 (cl-defstruct emacs-mcp-connection
   "State for one socket client connection."
   process
@@ -50,6 +58,10 @@ When nil, use `default-directory'."
   '(("emacs.get_selection" . emacs-mcp--rpc-get-selection)
     ("emacs.append_submission" . emacs-mcp--rpc-append-submission))
   "Method dispatch table for incoming bridge RPC calls.")
+
+(define-error 'emacs-mcp-json-parse-error "emacs-mcp JSON parse error")
+(define-error 'emacs-mcp-invalid-request "emacs-mcp invalid request")
+(define-error 'emacs-mcp-invalid-params "emacs-mcp invalid params")
 
 ;; ---------------------------------------------------------------------------
 ;; Generic scaffolding helpers
@@ -117,15 +129,31 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--validate-repo-relative-path (path)
   "Validate repo-relative PATH token."
-  (emacs-mcp--todo 'emacs-mcp--validate-repo-relative-path))
+  (unless (and (stringp path) (not (string-empty-p path)))
+    (error "Path must be a non-empty string"))
+  (when (string-match-p "\0" path)
+    (error "Path must not contain NUL bytes"))
+  (when (file-name-absolute-p path)
+    (error "Path must be repo-relative"))
+  (when (member ".." (split-string path "/" t))
+    (error "Path traversal is not allowed"))
+  path)
 
 (defun emacs-mcp--resolve-project-path (rel-path)
   "Resolve REL-PATH under project root and return canonical absolute path."
-  (emacs-mcp--todo 'emacs-mcp--resolve-project-path))
+  (emacs-mcp--validate-repo-relative-path rel-path)
+  (let* ((root (file-name-as-directory (emacs-mcp-project-root)))
+         (candidate (file-truename (expand-file-name rel-path root))))
+    (unless (emacs-mcp--path-under-project-root-p candidate)
+      (error "Path escapes project root"))
+    candidate))
 
 (defun emacs-mcp--path-under-project-root-p (abs-path)
   "Return non-nil if ABS-PATH resolves inside project root."
-  (emacs-mcp--todo 'emacs-mcp--path-under-project-root-p))
+  (let ((root (file-name-as-directory (file-truename (emacs-mcp-project-root))))
+        (candidate (file-truename abs-path)))
+    (and (not (emacs-mcp--path-remote-p candidate))
+         (file-in-directory-p candidate root))))
 
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle module (public commands)
@@ -216,6 +244,7 @@ When nil, use `default-directory'."
            :service socket-path
            :server t
            :noquery t
+           :log #'emacs-mcp--socket-log
            :filter #'emacs-mcp--socket-filter
            :sentinel #'emacs-mcp--socket-sentinel))
     (emacs-mcp--set-private-mode socket-path #o600)
@@ -238,14 +267,54 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--socket-filter (process chunk)
   "Socket filter for incoming CHUNK from PROCESS."
-  (ignore process chunk)
-  nil)
+  (let* ((conn (or (gethash process emacs-mcp--connections)
+                   (progn
+                     (emacs-mcp--register-client process)
+                     (gethash process emacs-mcp--connections))))
+         (partial (or (emacs-mcp-connection-partial-input conn) ""))
+         (buffer (concat partial chunk))
+         (start 0)
+         newline-index
+         (drop-client nil))
+    (while (and (not drop-client)
+                (setq newline-index (string-match "\n" buffer start)))
+      (let ((line (substring buffer start newline-index)))
+        (when (> (string-bytes line) emacs-mcp-max-request-line-bytes)
+          (emacs-mcp--server-log "Dropping client: oversized request line")
+          (emacs-mcp--send-response
+           process
+           (emacs-mcp--rpc-error nil "invalid_request" "Request line exceeds size limit"))
+          (setq drop-client t))
+        (unless drop-client
+          (condition-case err
+              (emacs-mcp--rpc-handle-line process line)
+            (error
+             (emacs-mcp--server-log "Failed to handle socket line: %s" err)))))
+      (setq start (1+ newline-index)))
+    (if drop-client
+        (emacs-mcp--close-client process)
+      (setf (emacs-mcp-connection-partial-input conn)
+            (substring buffer start))
+      (when (> (string-bytes (emacs-mcp-connection-partial-input conn))
+               emacs-mcp-max-request-line-bytes)
+        (emacs-mcp--server-log "Dropping client: partial line exceeds size limit")
+        (emacs-mcp--send-response
+         process
+         (emacs-mcp--rpc-error nil "invalid_request" "Request line exceeds size limit"))
+        (emacs-mcp--close-client process)))))
 
 (defun emacs-mcp--socket-sentinel (process event)
   "Socket sentinel for PROCESS with EVENT."
   (ignore event)
   (unless (eq process emacs-mcp--socket-process)
     (emacs-mcp--unregister-client process)))
+
+(defun emacs-mcp--socket-log (server client message)
+  "Track socket CLIENT lifecycle events for SERVER."
+  (ignore server message)
+  (if (process-live-p client)
+      (emacs-mcp--register-client client)
+    (emacs-mcp--unregister-client client)))
 
 (defun emacs-mcp--register-client (process)
   "Register PROCESS in `emacs-mcp--connections`."
@@ -255,10 +324,19 @@ When nil, use `default-directory'."
   "Unregister PROCESS from `emacs-mcp--connections`."
   (remhash process emacs-mcp--connections))
 
+(defun emacs-mcp--close-client (process)
+  "Close PROCESS and remove it from connection table."
+  (emacs-mcp--unregister-client process)
+  (when (process-live-p process)
+    (delete-process process)))
+
 (defun emacs-mcp--send-response (process response)
   "Serialize RESPONSE and send to PROCESS."
-  (ignore process response)
-  (emacs-mcp--todo 'emacs-mcp--send-response))
+  (when (process-live-p process)
+    (condition-case err
+        (process-send-string process (emacs-mcp--encode-json-line response))
+      (error
+       (emacs-mcp--server-log "Failed to send response: %s" err)))))
 
 ;; ---------------------------------------------------------------------------
 ;; RPC module
@@ -266,13 +344,22 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--decode-json-line (line)
   "Decode LINE JSON and return Lisp object."
-  (ignore line)
-  (emacs-mcp--todo 'emacs-mcp--decode-json-line))
+  (condition-case err
+      (let ((json-object-type 'alist)
+            (json-array-type 'vector)
+            (json-key-type 'string)
+            (json-false :json-false)
+            (json-null :json-null))
+        (json-read-from-string line))
+    (json-error
+     (signal 'emacs-mcp-json-parse-error (list (error-message-string err))))))
 
 (defun emacs-mcp--encode-json-line (object)
   "Encode OBJECT as compact one-line JSON."
-  (ignore object)
-  (emacs-mcp--todo 'emacs-mcp--encode-json-line))
+  (let ((json-encoding-pretty-print nil)
+        (json-false :json-false)
+        (json-null nil))
+    (concat (json-encode object) "\n")))
 
 (defun emacs-mcp--rpc-result (id result)
   "Build JSON-RPC-like success response with ID and RESULT."
@@ -284,18 +371,77 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--parse-request (obj)
   "Validate and parse request OBJ into `emacs-mcp-request`."
-  (ignore obj)
-  (emacs-mcp--todo 'emacs-mcp--parse-request))
+  (let ((missing (make-symbol "missing")))
+    (unless (and (listp obj) (cl-every #'consp obj))
+      (signal 'emacs-mcp-invalid-request '("Request must be a JSON object")))
+    (let* ((id (alist-get "id" obj missing nil #'equal))
+           (method (alist-get "method" obj missing nil #'equal))
+           (jsonrpc (alist-get "jsonrpc" obj missing nil #'equal))
+           (params-cell (assoc "params" obj))
+           (params (if params-cell (cdr params-cell) '())))
+      (unless (integerp id)
+        (signal 'emacs-mcp-invalid-request '("Request 'id' must be an integer")))
+      (unless (stringp method)
+        (signal 'emacs-mcp-invalid-request '("Request 'method' must be a string")))
+      (unless (or (eq jsonrpc missing) (equal jsonrpc "2.0"))
+        (signal 'emacs-mcp-invalid-request '("Request 'jsonrpc' must be \"2.0\" when present")))
+      (unless (and (listp params) (cl-every #'consp params))
+        (signal 'emacs-mcp-invalid-request '("Request 'params' must be a JSON object when present")))
+      (make-emacs-mcp-request :id id :method method :params params))))
 
 (defun emacs-mcp--dispatch-request (request)
   "Dispatch parsed REQUEST and return result or error object."
-  (ignore request)
-  (emacs-mcp--todo 'emacs-mcp--dispatch-request))
+  (let* ((request-id (emacs-mcp-request-id request))
+         (method (emacs-mcp-request-method request))
+         (handler (cdr (assoc method emacs-mcp--rpc-method-handlers))))
+    (if (not handler)
+        (emacs-mcp--rpc-error request-id "method_not_found" (format "Unknown method: %s" method))
+      (condition-case err
+          (let ((validated-params
+                 (emacs-mcp--validate-method-params
+                  method
+                  (emacs-mcp-request-params request))))
+            (emacs-mcp--rpc-result request-id (funcall handler validated-params)))
+        (emacs-mcp-invalid-params
+         (emacs-mcp--rpc-error request-id "invalid_params" (or (cadr err) "Invalid params")))
+        (error
+         (emacs-mcp--rpc-error request-id "internal_error" (error-message-string err)))))))
+
+(defun emacs-mcp--validate-method-params (method params)
+  "Validate PARAMS for METHOD and return normalized params."
+  (pcase method
+    ("emacs.get_selection"
+     (when params
+       (signal 'emacs-mcp-invalid-params '("Invalid params for emacs.get_selection: expected empty object")))
+     '())
+    (_ (error "Missing params validator for method: %s" method))))
+
+(defun emacs-mcp--extract-request-id (obj)
+  "Extract integer request ID from decoded JSON OBJ, or nil."
+  (when (and (listp obj) (cl-every #'consp obj))
+    (let ((id (alist-get "id" obj nil nil #'equal)))
+      (when (integerp id)
+        id))))
 
 (defun emacs-mcp--rpc-handle-line (process line)
   "Parse and handle one incoming LINE from PROCESS."
-  (ignore process line)
-  (emacs-mcp--todo 'emacs-mcp--rpc-handle-line))
+  (let ((decoded nil)
+        (request-id nil)
+        (response nil))
+    (condition-case err
+        (progn
+          (setq decoded (emacs-mcp--decode-json-line line))
+          (setq request-id (emacs-mcp--extract-request-id decoded))
+          (setq response (emacs-mcp--dispatch-request (emacs-mcp--parse-request decoded))))
+      (emacs-mcp-json-parse-error
+       (setq response (emacs-mcp--rpc-error nil "parse_error" (car (cdr err)))))
+      (emacs-mcp-invalid-request
+       (setq response (emacs-mcp--rpc-error request-id "invalid_request" (car (cdr err)))))
+      (emacs-mcp-invalid-params
+       (setq response (emacs-mcp--rpc-error request-id "invalid_params" (car (cdr err)))))
+      (error
+       (setq response (emacs-mcp--rpc-error request-id "internal_error" (error-message-string err)))))
+    (emacs-mcp--send-response process response)))
 
 ;; ---------------------------------------------------------------------------
 ;; RPC method handlers module
@@ -304,7 +450,7 @@ When nil, use `default-directory'."
 (defun emacs-mcp--rpc-get-selection (params)
   "Handle `emacs.get_selection` with PARAMS."
   (ignore params)
-  (emacs-mcp--todo 'emacs-mcp--rpc-get-selection))
+  (emacs-mcp--selection-data))
 
 (defun emacs-mcp--rpc-append-submission (params)
   "Handle `emacs.append_submission` with PARAMS."
@@ -317,16 +463,38 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--selection-data ()
   "Return selection payload expected by `emacs.get_selection`."
-  (emacs-mcp--todo 'emacs-mcp--selection-data))
+  (if (not (use-region-p))
+      (emacs-mcp--selection-refused "no active region")
+    (let ((rel-path (emacs-mcp--selection-file-relative-path)))
+      (if (not rel-path)
+          (emacs-mcp--selection-refused "outside project root")
+        (let* ((start (region-beginning))
+               (end (region-end))
+               (text (buffer-substring-no-properties start end)))
+          (if (> (string-bytes text) emacs-mcp-max-selection-bytes)
+              (emacs-mcp--selection-refused "refused")
+            `((ok . t)
+              (file . ,rel-path)
+              (start . ,(emacs-mcp--selection-point start))
+              (end . ,(emacs-mcp--selection-point end))
+              (text . ,text))))))))
 
 (defun emacs-mcp--selection-point (pos)
   "Build point object for POS with line/col/pos."
-  (ignore pos)
-  (emacs-mcp--todo 'emacs-mcp--selection-point))
+  (save-excursion
+    (goto-char pos)
+    `((line . ,(line-number-at-pos pos t))
+      (col . ,(current-column))
+      (pos . ,pos))))
 
 (defun emacs-mcp--selection-file-relative-path ()
   "Return repo-relative path for current buffer file."
-  (emacs-mcp--todo 'emacs-mcp--selection-file-relative-path))
+  (let ((path (buffer-file-name)))
+    (when (and path (not (emacs-mcp--path-remote-p path)))
+      (let ((abs-path (file-truename path))
+            (root (file-truename (emacs-mcp-project-root))))
+        (when (emacs-mcp--path-under-project-root-p abs-path)
+          (file-relative-name abs-path (file-name-as-directory root)))))))
 
 (defun emacs-mcp--selection-refused (reason)
   "Return `{ok:false}` payload with REASON."
