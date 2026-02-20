@@ -3,6 +3,7 @@
 (require 'cl-lib)
 (require 'json)
 (require 'subr-x)
+(declare-function org-back-to-heading "org" (&optional invisible-ok))
 
 (defgroup emacs-mcp nil
   "Human-in-the-loop MCP workflow for Emacs."
@@ -506,22 +507,57 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp-submissions-buffer ()
   "Return submissions buffer, creating it if needed."
-  (get-buffer-create emacs-mcp-submissions-buffer-name))
+  (let ((buffer (get-buffer-create emacs-mcp-submissions-buffer-name)))
+    (with-current-buffer buffer
+      (unless (derived-mode-p 'org-mode)
+        (org-mode))
+      (setq-local truncate-lines t))
+    buffer))
 
 (defun emacs-mcp-open-submissions ()
   "Open submissions buffer."
   (interactive)
-  (emacs-mcp--todo 'emacs-mcp-open-submissions))
+  (let ((buffer (emacs-mcp-submissions-buffer)))
+    (pop-to-buffer buffer)
+    (goto-char (point-max))
+    buffer))
 
 (defun emacs-mcp-open-review-layout ()
   "Open a review-focused 2-window layout."
   (interactive)
-  (emacs-mcp--todo 'emacs-mcp-open-review-layout))
+  (let* ((submissions-buffer (emacs-mcp-submissions-buffer))
+         (project-root (emacs-mcp-project-root))
+         (current-buffer-file (buffer-file-name))
+         (target-buffer
+          (when (and current-buffer-file
+                     (not (emacs-mcp--path-remote-p current-buffer-file))
+                     (emacs-mcp--path-under-project-root-p (file-truename current-buffer-file)))
+            (current-buffer))))
+    (delete-other-windows)
+    (let* ((left-window (selected-window))
+           (right-window (split-window-right)))
+      (set-window-buffer left-window submissions-buffer)
+      (with-selected-window left-window
+        (goto-char (point-max)))
+      (if target-buffer
+          (set-window-buffer right-window target-buffer)
+        (with-selected-window right-window
+          (dired project-root)))
+      (select-window left-window))))
 
 (defun emacs-mcp-open-target-at-point ()
   "Open/switch right pane to target file for submission at point."
   (interactive)
-  (emacs-mcp--todo 'emacs-mcp-open-target-at-point))
+  (let* ((rel-path (emacs-mcp--submission-path-at-point))
+         (abs-path (emacs-mcp--resolve-project-path rel-path))
+         (target-buffer (find-file-noselect abs-path))
+         (target-window
+          (if (= (count-windows) 1)
+              (split-window-right)
+            (or (window-in-direction 'right)
+                (next-window)))))
+    (set-window-buffer target-window target-buffer)
+    (message "emacs-mcp opened target: %s" rel-path)))
 
 (defun emacs-mcp--append-submission-section (path description diff)
   "Append one submission section for PATH, DESCRIPTION, and DIFF."
@@ -530,7 +566,36 @@ When nil, use `default-directory'."
 
 (defun emacs-mcp--submission-path-at-point ()
   "Extract submission target path from current section."
-  (emacs-mcp--todo 'emacs-mcp--submission-path-at-point))
+  (let* ((raw-line
+          (save-excursion
+            (if (derived-mode-p 'org-mode)
+                (progn
+                  (unless (fboundp 'org-back-to-heading)
+                    (require 'org))
+                  (org-back-to-heading t)
+                  (buffer-substring-no-properties
+                   (line-beginning-position)
+                   (line-end-position)))
+              (or (thing-at-point 'line t) ""))))
+         (line (string-trim raw-line))
+         (path
+          (cond
+           ((string-match
+             "^\\*+\\s-+\\(.+?\\)\\(?:\\s-+\\[[^]]+\\]\\)?\\s-*$"
+             line)
+            (match-string 1 line))
+           ((string-match "path:\\s-*\\(.+\\)$" line)
+            (match-string 1 line))
+           (t nil))))
+    (unless path
+      (user-error "Cannot extract submission path at point"))
+    (condition-case err
+        (progn
+          (emacs-mcp--validate-repo-relative-path path)
+          path)
+      (error
+       (user-error "Invalid submission path at point: %s"
+                   (error-message-string err))))))
 
 (defun emacs-mcp--submission-section-heading (path timestamp)
   "Format submission heading for PATH and TIMESTAMP."
