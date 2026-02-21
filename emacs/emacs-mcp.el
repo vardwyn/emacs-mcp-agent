@@ -12,8 +12,8 @@
 
 (defcustom emacs-mcp-project-root nil
   "Absolute project root used for path validation.
-When nil, use `default-directory'."
-  :type '(choice (const :tag "Use default-directory" nil) directory))
+Set explicitly by `emacs-mcp-start' (interactive prompt or argument)."
+  :type '(choice (const :tag "Unset" nil) directory))
 
 (defcustom emacs-mcp-submissions-buffer-name "*emacs-mcp submissions*"
   "Buffer name used for accumulated submissions."
@@ -57,6 +57,7 @@ When nil, use `default-directory'."
 
 (defvar emacs-mcp--rpc-method-handlers
   '(("emacs.get_selection" . emacs-mcp--rpc-get-selection)
+    ("emacs.get_project_root" . emacs-mcp--rpc-get-project-root)
     ("emacs.append_submission" . emacs-mcp--rpc-append-submission))
   "Method dispatch table for incoming bridge RPC calls.")
 
@@ -77,10 +78,22 @@ When nil, use `default-directory'."
 ;; ---------------------------------------------------------------------------
 
 (defun emacs-mcp-project-root ()
-  "Return canonical absolute project root."
-  (file-truename
-   (or emacs-mcp-project-root
-       default-directory)))
+  "Return canonical absolute project root.
+Raise an error when root is not configured."
+  (unless emacs-mcp-project-root
+    (error "emacs-mcp project root is not set; run emacs-mcp-start with explicit root"))
+  (emacs-mcp--canonicalize-project-root emacs-mcp-project-root))
+
+(defun emacs-mcp--canonicalize-project-root (project-root)
+  "Validate and canonicalize PROJECT-ROOT."
+  (unless (and (stringp project-root) (not (string-empty-p project-root)))
+    (error "Project root must be a non-empty string"))
+  (let ((expanded (expand-file-name project-root)))
+    (when (emacs-mcp--path-remote-p expanded)
+      (error "Project root must be local, not remote"))
+    (unless (file-directory-p expanded)
+      (error "Project root directory does not exist: %s" expanded))
+    (file-name-as-directory (file-truename expanded))))
 
 (defun emacs-mcp-cache-dir ()
   "Return `${XDG_CACHE_HOME:-~/.cache}/emacs-mcp`."
@@ -165,12 +178,19 @@ When nil, use `default-directory'."
   (and (processp emacs-mcp--socket-process)
        (process-live-p emacs-mcp--socket-process)))
 
-(defun emacs-mcp-start ()
-  "Start emacs-mcp local socket server."
-  (interactive)
+(defun emacs-mcp-start (&optional project-root)
+  "Start emacs-mcp local socket server with explicit PROJECT-ROOT."
+  (interactive
+   (list (read-directory-name "Project root: " nil nil t)))
+  (unless project-root
+    (user-error "Project root is required"))
+  (setq emacs-mcp-project-root
+        (emacs-mcp--canonicalize-project-root project-root))
   (emacs-mcp--start-socket-server)
   (emacs-mcp--install-kill-hook)
-  (message "emacs-mcp started on %s" (emacs-mcp-socket-path)))
+  (message "emacs-mcp started on %s (root: %s)"
+           (emacs-mcp-socket-path)
+           (emacs-mcp-project-root)))
 
 (defun emacs-mcp-stop ()
   "Stop emacs-mcp local socket server and cleanup socket path."
@@ -424,6 +444,10 @@ When nil, use `default-directory'."
      (when params
        (signal 'emacs-mcp-invalid-params '("Invalid params for emacs.get_selection: expected empty object")))
      '())
+    ("emacs.get_project_root"
+     (when params
+       (signal 'emacs-mcp-invalid-params '("Invalid params for emacs.get_project_root: expected empty object")))
+     '())
     (_ (error "Missing params validator for method: %s" method))))
 
 (defun emacs-mcp--extract-request-id (obj)
@@ -461,6 +485,11 @@ When nil, use `default-directory'."
   "Handle `emacs.get_selection` with PARAMS."
   (ignore params)
   (emacs-mcp--selection-data))
+
+(defun emacs-mcp--rpc-get-project-root (params)
+  "Handle `emacs.get_project_root` with PARAMS."
+  (ignore params)
+  `((ok . t) (project_root . ,(emacs-mcp-project-root))))
 
 (defun emacs-mcp--rpc-append-submission (params)
   "Handle `emacs.append_submission` with PARAMS."
