@@ -131,7 +131,41 @@ Raise an error when root is not configured."
 
 (defun emacs-mcp--atomic-write-json (path payload)
   "Atomically write JSON PAYLOAD to PATH."
-  (emacs-mcp--todo 'emacs-mcp--atomic-write-json))
+  (unless (and (stringp path) (not (string-empty-p path)))
+    (error "Atomic write path must be a non-empty string"))
+  (when (emacs-mcp--path-remote-p path)
+    (error "Atomic write path must be local"))
+  (let* ((target-path (expand-file-name path))
+         (target-dir (file-name-directory target-path))
+         (target-name (file-name-nondirectory target-path))
+         (temp-path nil)
+         (json-encoding-pretty-print nil)
+         (json-false :json-false)
+         (json-null nil)
+         (payload-text (concat (json-encode payload) "\n")))
+    (unless (and target-dir (not (string-empty-p target-dir)))
+      (error "Atomic write target has no parent directory: %s" target-path))
+    (make-directory target-dir t)
+    (emacs-mcp--set-private-mode target-dir #o700)
+    (unwind-protect
+        (progn
+          (setq temp-path
+                (make-temp-file
+                 (concat (file-name-as-directory target-dir)
+                         "."
+                         target-name
+                         ".tmp-")))
+          (let ((coding-system-for-write 'utf-8-unix))
+            (with-temp-file temp-path
+              (insert payload-text)))
+          (emacs-mcp--set-private-mode temp-path #o600)
+          (rename-file temp-path target-path t)
+          (setq temp-path nil)
+          (emacs-mcp--set-private-mode target-path #o600)
+          target-path)
+      (when (and temp-path (file-exists-p temp-path))
+        (ignore-errors
+          (delete-file temp-path))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Path validation module
@@ -719,28 +753,66 @@ Raise an error when root is not configured."
 ;; Feedback module
 ;; ---------------------------------------------------------------------------
 
+(defun emacs-mcp--normalize-finalize-path (path)
+  "Normalize PATH and return repo-relative path under project root."
+  (unless (and (stringp path) (not (string-empty-p path)))
+    (user-error "File path is required"))
+  (when (emacs-mcp--path-remote-p path)
+    (user-error "Cannot finalize remote path: %s" path))
+  (let* ((project-root (file-name-as-directory (emacs-mcp-project-root)))
+         (candidate-path
+          (if (file-name-absolute-p path)
+              path
+            (expand-file-name path project-root))))
+    (condition-case err
+        (let ((resolved-path (file-truename candidate-path)))
+          (unless (emacs-mcp--path-under-project-root-p resolved-path)
+            (user-error "File is outside project root: %s" candidate-path))
+          (let ((rel-path (file-relative-name resolved-path project-root)))
+            (emacs-mcp--validate-repo-relative-path rel-path)
+            rel-path))
+      (error
+       (user-error "Invalid finalize path: %s" (error-message-string err))))))
+
 (defun emacs-mcp-finalize-file (path &optional user-message)
   "Finalize active cycle for PATH with optional USER-MESSAGE."
   (interactive
    (list (read-file-name "File: " (emacs-mcp-project-root))
          (read-string "User message (optional): ")))
-  (ignore path user-message)
-  (emacs-mcp--todo 'emacs-mcp-finalize-file))
+  (unless (or (null user-message) (stringp user-message))
+    (user-error "User message must be a string"))
+  (let* ((rel-path (emacs-mcp--normalize-finalize-path path))
+         (event-path (emacs-mcp--write-finalize-event rel-path user-message)))
+    (message "emacs-mcp queued finalize event for %s" rel-path)
+    event-path))
 
 (defun emacs-mcp-finalize-current-buffer (&optional user-message)
   "Finalize current buffer file with optional USER-MESSAGE."
   (interactive (list (read-string "User message (optional): ")))
-  (ignore user-message)
-  (emacs-mcp--todo 'emacs-mcp-finalize-current-buffer))
+  (let ((path (buffer-file-name)))
+    (unless path
+      (user-error "Current buffer is not visiting a file"))
+    (emacs-mcp-finalize-file path user-message)))
 
 (defun emacs-mcp--write-finalize-event (rel-path user-message)
   "Write one finalize event for REL-PATH and USER-MESSAGE."
-  (ignore rel-path user-message)
-  (emacs-mcp--todo 'emacs-mcp--write-finalize-event))
+  (emacs-mcp--validate-repo-relative-path rel-path)
+  (unless (or (null user-message) (stringp user-message))
+    (error "Finalize user message must be a string or nil"))
+  (emacs-mcp--ensure-runtime-dirs)
+  (let* ((payload (emacs-mcp--finalize-event-payload rel-path user-message))
+         (event-path (emacs-mcp--finalize-event-file-path)))
+    (emacs-mcp--atomic-write-json event-path payload)
+    event-path))
 
 (defun emacs-mcp--finalize-event-file-path ()
   "Return path for a new finalize event file."
-  (emacs-mcp--todo 'emacs-mcp--finalize-event-file-path))
+  (let* ((inbox-dir (emacs-mcp-feedback-inbox-dir))
+         (timestamp (format-time-string "%Y%m%dT%H%M%S%6NZ" (current-time) t))
+         (pid (or (emacs-pid) 0))
+         (random-fragment (format "%06x" (random #x1000000)))
+         (filename (format "event-%s-%d-%s.json" timestamp pid random-fragment)))
+    (expand-file-name filename inbox-dir)))
 
 (defun emacs-mcp--finalize-event-payload (rel-path user-message)
   "Build finalize event JSON payload."
