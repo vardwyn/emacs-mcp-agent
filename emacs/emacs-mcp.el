@@ -448,6 +448,43 @@ Raise an error when root is not configured."
      (when params
        (signal 'emacs-mcp-invalid-params '("Invalid params for emacs.get_project_root: expected empty object")))
      '())
+    ("emacs.append_submission"
+     (unless (and (listp params) (cl-every #'consp params))
+       (signal 'emacs-mcp-invalid-params
+               '("Invalid params for emacs.append_submission: expected object")))
+     (let* ((allowed-keys '("path" "description" "diff"))
+            (unknown-keys
+             (delete-dups
+              (cl-loop for (key . _value) in params
+                       unless (member key allowed-keys)
+                       collect key)))
+            (path (alist-get "path" params nil nil #'equal))
+            (description (alist-get "description" params nil nil #'equal))
+            (diff (alist-get "diff" params nil nil #'equal)))
+       (when unknown-keys
+         (signal 'emacs-mcp-invalid-params
+                 (list
+                  (format
+                   "Invalid params for emacs.append_submission: unexpected keys: %s"
+                   (string-join (sort unknown-keys #'string<) ", ")))))
+       (unless (and (stringp path) (not (string-empty-p path)))
+         (signal 'emacs-mcp-invalid-params
+                 '("Invalid params for emacs.append_submission: 'path' must be a non-empty string")))
+       (unless (stringp description)
+         (signal 'emacs-mcp-invalid-params
+                 '("Invalid params for emacs.append_submission: 'description' must be a string")))
+       (unless (stringp diff)
+         (signal 'emacs-mcp-invalid-params
+                 '("Invalid params for emacs.append_submission: 'diff' must be a string")))
+       (condition-case err
+           (emacs-mcp--validate-repo-relative-path path)
+         (error
+          (signal 'emacs-mcp-invalid-params
+                  (list
+                   (format
+                    "Invalid params for emacs.append_submission: invalid 'path': %s"
+                    (error-message-string err))))))
+       `((path . ,path) (description . ,description) (diff . ,diff))))
     (_ (error "Missing params validator for method: %s" method))))
 
 (defun emacs-mcp--extract-request-id (obj)
@@ -493,8 +530,11 @@ Raise an error when root is not configured."
 
 (defun emacs-mcp--rpc-append-submission (params)
   "Handle `emacs.append_submission` with PARAMS."
-  (ignore params)
-  (emacs-mcp--todo 'emacs-mcp--rpc-append-submission))
+  (let ((path (alist-get 'path params))
+        (description (alist-get 'description params))
+        (diff (alist-get 'diff params)))
+    (emacs-mcp--append-submission-section path description diff)
+    '((ok . t))))
 
 ;; ---------------------------------------------------------------------------
 ;; Selection module
@@ -599,8 +639,40 @@ Raise an error when root is not configured."
 
 (defun emacs-mcp--append-submission-section (path description diff)
   "Append one submission section for PATH, DESCRIPTION, and DIFF."
-  (ignore path description diff)
-  (emacs-mcp--todo 'emacs-mcp--append-submission-section))
+  (unless (stringp path)
+    (error "Submission path must be a string"))
+  (unless (stringp description)
+    (error "Submission description must be a string"))
+  (unless (stringp diff)
+    (error "Submission diff must be a string"))
+  (emacs-mcp--validate-repo-relative-path path)
+  (let* ((timestamp (format-time-string "%Y-%m-%d %H:%M:%S"))
+         (heading (emacs-mcp--submission-section-heading path timestamp))
+         (description-text
+          (let ((trimmed (string-trim-right description)))
+            (if (string-empty-p trimmed)
+                "(no description)"
+              trimmed)))
+         (diff-text
+          (if (string-suffix-p "\n" diff)
+              diff
+            (concat diff "\n")))
+         (section
+          (concat
+           heading "\n\n"
+           description-text "\n\n"
+           "#+begin_src diff\n"
+           diff-text
+           "#+end_src\n")))
+    (with-current-buffer (emacs-mcp-submissions-buffer)
+      (goto-char (point-max))
+      (unless (bobp)
+        (unless (eq (char-before) ?\n)
+          (insert "\n"))
+        (insert "\n"))
+      (insert section)
+      (goto-char (point-max))
+      t)))
 
 (defun emacs-mcp--submission-path-at-point ()
   "Extract submission target path from current section."
@@ -637,8 +709,11 @@ Raise an error when root is not configured."
 
 (defun emacs-mcp--submission-section-heading (path timestamp)
   "Format submission heading for PATH and TIMESTAMP."
-  (ignore path timestamp)
-  (emacs-mcp--todo 'emacs-mcp--submission-section-heading))
+  (unless (and (stringp path) (not (string-empty-p path)))
+    (error "Submission heading path must be a non-empty string"))
+  (unless (and (stringp timestamp) (not (string-empty-p timestamp)))
+    (error "Submission heading timestamp must be a non-empty string"))
+  (format "* %s [%s]" path timestamp))
 
 ;; ---------------------------------------------------------------------------
 ;; Feedback module
