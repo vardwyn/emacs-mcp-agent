@@ -15,7 +15,7 @@ from typing import Any
 TOOL_SPECS = (
     {
         "name": "emacs.ping",
-        "description": "Quick connectivity check.",
+        "description": "Health check for Python MCP server + Emacs bridge.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -602,6 +602,44 @@ class EmacsMcpServer:
             raise ToolError("invalid_response", "Invalid emacs.get_selection result: invalid 'reason'")
         return {"ok": False, "reason": reason}
 
+    def _validate_bridge_project_root_result(self, result: Any) -> str:
+        if not isinstance(result, dict):
+            raise ToolError("invalid_response", "Invalid emacs.get_project_root result: expected object")
+
+        unknown_keys = sorted(set(result.keys()) - {"ok", "project_root"})
+        if unknown_keys:
+            raise ToolError(
+                "invalid_response",
+                (
+                    "Invalid emacs.get_project_root result: unexpected keys: "
+                    f"{', '.join(unknown_keys)}"
+                ),
+            )
+
+        ok = result.get("ok")
+        if not isinstance(ok, bool):
+            raise ToolError(
+                "invalid_response",
+                "Invalid emacs.get_project_root result: missing boolean 'ok'",
+            )
+        if not ok:
+            raise ToolError("not_ready", "emacs-mcp not ready: emacs root provider returned ok=false")
+
+        bridge_root = result.get("project_root")
+        if not isinstance(bridge_root, str) or not bridge_root:
+            raise ToolError(
+                "invalid_response",
+                "Invalid emacs.get_project_root result: invalid 'project_root'",
+            )
+
+        canonical_bridge_root = os.path.realpath(bridge_root)
+        if not canonical_bridge_root:
+            raise ToolError(
+                "invalid_response",
+                "Invalid emacs.get_project_root result: empty canonical project root",
+            )
+        return canonical_bridge_root
+
 
     def _validate_no_keys(self, arguments: dict[str, Any], tool_name: str) -> None:
         if arguments:
@@ -1160,7 +1198,30 @@ class EmacsMcpServer:
 
     # Tool handlers
     def tool_ping(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        return {"ok": True}
+        python_project_root = os.path.realpath(str(self.paths.project_root))
+        try:
+            bridge_result = self.emacs_client.call("emacs.get_project_root", {})
+            emacs_project_root = self._validate_bridge_project_root_result(bridge_result)
+        except ToolError as exc:
+            if exc.code in {"emacs_unreachable", "invalid_response", "root_mismatch", "not_ready"}:
+                raise
+            raise ToolError("not_ready", f"emacs-mcp not ready: {exc.message}")
+
+        if python_project_root != emacs_project_root:
+            raise ToolError(
+                "root_mismatch",
+                (
+                    "Python and Emacs project roots differ "
+                    f"(python={python_project_root}, emacs={emacs_project_root})"
+                ),
+            )
+
+        return {
+            "ok": True,
+            "status": "ready",
+            "python_project_root": python_project_root,
+            "emacs_project_root": emacs_project_root,
+        }
 
     def tool_get_project_root(self, arguments: dict[str, Any]) -> dict[str, Any]:
         return {"ok": True, "project_root": str(self.paths.project_root)}
