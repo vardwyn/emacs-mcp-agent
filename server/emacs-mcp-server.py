@@ -867,6 +867,7 @@ class EmacsMcpServer:
         assert isinstance(active_files, dict), "active_files must be a dict"
         active_files.pop(rel_path, None)
 
+    def _cleanup_before_snapshot(self, rel_path: str) -> None:
         before_snapshot_path = self._before_snapshot_path(rel_path)
         try:
             if before_snapshot_path.exists():
@@ -1093,6 +1094,7 @@ class EmacsMcpServer:
             if isinstance(active_entry, dict):
                 self._clear_active_file(rel_path, active_index)
                 self._save_active_index(active_index)
+                self._cleanup_before_snapshot(rel_path)
 
     def _load_pending_item(self, pending_path: Path) -> dict[str, Any]:
         try:
