@@ -1059,6 +1059,7 @@ class EmacsMcpServer:
         for inbox_path in inbox_files:
             rel_path, user_message = self._extract_finalize_event(inbox_path)
             abs_path = self._validate_path_from_index(rel_path)
+            before_snapshot_path = self._before_snapshot_path(rel_path)
 
             applied_diff = ""
             active_files = active_index.get("active_files", {})
@@ -1080,6 +1081,21 @@ class EmacsMcpServer:
                     after_text=after_text,
                     after_exists=after_exists,
                 )
+                self._clear_active_file(rel_path, active_index)
+                self._save_active_index(active_index)
+            else:
+                try:
+                    has_before_snapshot = before_snapshot_path.exists()
+                except OSError as exc:
+                    raise ToolError(
+                        "io_error",
+                        f"Failed to inspect BEFORE snapshot for {rel_path}: {exc}",
+                    )
+                if has_before_snapshot:
+                    raise ToolError(
+                        "state_corrupt",
+                        f"Found BEFORE snapshot without active index entry for {rel_path}",
+                    )
 
             feedback_id = self._allocate_feedback_id()
             pending_path = self._pending_item_path(feedback_id)
@@ -1095,25 +1111,12 @@ class EmacsMcpServer:
             try:
                 inbox_path.unlink()
             except OSError as exc:
-                processed_path = inbox_path.with_suffix(f"{inbox_path.suffix}.processed")
-                try:
-                    os.replace(inbox_path, processed_path)
-                except OSError as quarantine_exc:
-                    try:
-                        pending_path.unlink()
-                    except OSError:
-                        pass
-                    raise ToolError(
-                        "io_error",
-                        (
-                            f"Failed to clear processed feedback inbox event {inbox_path}: {exc}; "
-                            f"failed to quarantine event: {quarantine_exc}"
-                        ),
-                    )
+                raise ToolError(
+                    "io_error",
+                    f"Failed to clear processed feedback inbox event {inbox_path}: {exc}",
+                )
 
             if isinstance(active_entry, dict):
-                self._clear_active_file(rel_path, active_index)
-                self._save_active_index(active_index)
                 self._cleanup_before_snapshot(rel_path)
 
     def _load_pending_item(self, pending_path: Path) -> dict[str, Any]:
