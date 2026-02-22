@@ -1,0 +1,138 @@
+#+title: emacs-mcp
+#+options: toc:nil
+
+* What This Is
+
+emacs-mcp is a minimal Model Context Protocol (MCP) tool surface designed for a human-in-the-loop Emacs workflow:
+
+- A *Python MCP server* (stdio JSON-RPC) exposes a small set of tools (`emacs.submit_diff`, `emacs.get_selection`, feedback tools)
+- An *Emacs bridge* (`emacs/emacs-mcp.el`) listens on a local Unix socket and provides a review UI (an Org submissions buffer + navigation helpers).
+- The agent *proposes* small changes via MCP; a human *reviews/applies/saves* in Emacs and then *finalizes per file* to send feedback back to the agent.
+
+* Workflow
+
+** Start (new session)
+
+1. Start the Emacs bridge first:
+   - `M-x emacs-mcp-start`
+   - pick the repo/project root directory (this must be explicit)
+2. In a terminal, `cd` to the same repo root directory.
+3. Start Codex (recommended via the wrapper below):
+   - `scripts/emacs-mcp-codex-runner.sh`
+4. In the agent session, call `emacs.ping` for MCP health check. Use emacs-mcp skill.
+
+** Review loop (multi-step, long sessions)
+
+1. Agent proposes one small change at a time via `emacs.submit_diff`:
+   - exactly one file (`path`)
+   - exactly one logical change per call
+2. In Emacs, review in the submissions buffer:
+   - `M-x emacs-mcp-open-review-layout` (two-pane layout)
+   - `M-x emacs-mcp-open-target-at-point` (open the target file for the submission at point)
+3. Apply changes to disk (however you prefer), then save buffers.
+4. Finalize per file (this is what enqueues feedback for the agent):
+   - `M-x emacs-mcp-finalize-current-buffer` or
+   - `M-x emacs-mcp-finalize-file`
+5. Only when you ask the agent to pull feedback, it should call:
+   - `emacs.feedback_list`, then `emacs.feedback_get` for ids you want to consume.
+
+** Resume (continue a prior session)
+
+1. Ensure the Emacs bridge is running with the correct root (`M-x emacs-mcp-start`).
+2. `cd` to the same repo root directory.
+3. Resume Codex:
+   - `scripts/emacs-mcp-codex-runner.sh resume --last`
+
+** Stop (clean shutdown)
+
+1. Stop Codex first (end the session).
+2. Stop the Emacs bridge:
+   - `M-x emacs-mcp-stop`
+
+* Installation
+
+** Prerequisites
+
+- Emacs with `json` + `org-mode` (both are bundled in recent Emacs).
+- Python 3 (the server uses only the standard library).
+- Codex CLI (`codex`) with MCP support.
+- Optional: Bubblewrap (`bwrap`) if you want OS-level read-only mounts and isolation.
+
+** Emacs bridge (`emacs/emacs-mcp.el`)
+
+Load the bridge and start it:
+
+#+begin_src elisp
+(use-package emacs-mcp
+  :straight (emacs-mcp
+             :type git :host github :repo "vardwyn/emacs-mcp"
+             :files ("emacs/*.el"))
+  :commands (emacs-mcp-start emacs-mcp-stop emacs-mcp-open-review-layout))
+;; Then run: M-x emacs-mcp-start
+#+end_src
+
+In Doom Emacs using ~package!~ macro in ~~/.doom.d/packages.el~:
+
+#+begin_src elisp
+(package! emacs-mcp
+  :recipe (:host github :repo "vardwyn/emacs-mcp"
+           :files ("emacs/*.el")))
+#+end_src
+
+** Python MCP server (`server/emacs-mcp-server.py`)
+
+1. From the repo root, register it once:
+
+#+begin_src sh
+cd /path/to/emacs-mcp
+codex mcp add emacs -- python3 server/emacs-mcp-server.py
+#+end_src
+
+2. Start Codex from the repo root (or use the wrapper script). The server computes:
+
+- `project_root = realpath(os.getcwd())` at startup
+- socket/state/feedback under `${XDG_CACHE_HOME:-~/.cache}/emacs-mcp`
+
+** Codex wrapper (recommended)
+
+The repo includes `scripts/emacs-mcp-codex-runner.sh`, which runs Codex under `bwrap` with:
+
+- `/` mounted read-only (defense-in-depth: the agent cannot directly edit the repo)
+- writable bind mounts for `/tmp`, `~/.codex`, and `${XDG_CACHE_HOME:-$HOME/.cache}/emacs-mcp`
+- Codex launched with `--ask-for-approval untrusted`
+
+Examples:
+
+#+begin_src sh
+# start a new interactive session (from repo root)
+scripts/emacs-mcp-codex-runner.sh
+
+# resume last session
+scripts/emacs-mcp-codex-runner.sh resume --last
+#+end_src
+
+** Agent skill (optional, but recommended for the intended workflow)
+
+This repo contains a Codex “skill” definition in `skills/emacs-mcp/`.
+
+Install by symlinking or copying into your Codex skills directory (commonly `~/.codex/skills`):
+
+#+begin_src sh
+mkdir -p ~/.codex/skills
+ln -s /path/to/emacs-mcp/skills/emacs-mcp ~/.codex/skills/emacs-mcp
+#+end_src
+
+The skill’s intent is: work normally, but propose file changes only via `emacs.submit_diff` in small single-file chunks, and only read feedback when the user explicitly asks.
+
+* Gotchas
+
+- Root matching is strict: Emacs chooses root at `emacs-mcp-start`, Python chooses root from `cwd`. Use `emacs.ping` to detect mismatches.
+- Read-only mounts are intentional: with the wrapper, commands that try to write into the repo (build artifacts, caches, lockfiles) will fail. Prefer directing outputs to `/tmp`, or run such commands outside the wrapper if needed.
+- Cache directory coupling: both Emacs and Python use `${XDG_CACHE_HOME:-~/.cache}/emacs-mcp`. If you override cache location, set `XDG_CACHE_HOME` consistently for both processes.
+- UTF-8 on the wire: the Emacs bridge socket uses `utf-8-unix` and the Python server decodes/encodes JSON as UTF-8. Keep diffs/messages UTF-8. If you work with non-UTF-8 file contents, you may see escaped/surrogate artifacts in diffs/feedback.
+- Size limits are byte-based (not character-based):
+  - transport line limits: `1 MiB` per JSON line (MCP stdin/stdout and Emacs socket)
+  - `emacs.submit_diff`: `description <= 256 KiB`, `diff <= 256 KiB` (UTF-8 bytes)
+  - `emacs.get_selection`: `text <= 256 KiB` (UTF-8 bytes)
+  Split large work into multiple submissions.
+- `emacs.feedback_get` consumes on read. Don’t call it unless you mean to mark the item as consumed.
