@@ -931,8 +931,8 @@ class EmacsMcpServer:
 
         body_lines = list(
             difflib.unified_diff(
-                before_text.splitlines(keepends=True),
-                after_text.splitlines(keepends=True),
+                before_text.splitlines(),
+                after_text.splitlines(),
                 fromfile=fromfile,
                 tofile=tofile,
                 lineterm="",
