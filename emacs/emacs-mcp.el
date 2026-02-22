@@ -28,11 +28,13 @@ Set explicitly by `emacs-mcp-start' (interactive prompt or argument)."
   :type 'integer)
 
 (defcustom emacs-mcp-max-request-line-bytes (* 1024 1024)
-  "Maximum bytes allowed for one incoming socket JSON line."
+  "Maximum bytes for one newline-delimited JSON request line over the local socket.
+When exceeded, the request is rejected and the client connection is closed."
   :type 'integer)
 
 (defcustom emacs-mcp-max-selection-bytes (* 256 1024)
-  "Maximum UTF-8 byte size returned by `emacs.get_selection` text payload."
+  "Maximum UTF-8 byte size for `emacs.get_selection` text payload.
+When exceeded, selection returns `{ok:false, reason:\"refused\"}`."
   :type 'integer)
 
 (cl-defstruct emacs-mcp-connection

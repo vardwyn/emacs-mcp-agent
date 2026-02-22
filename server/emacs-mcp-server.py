@@ -78,6 +78,9 @@ TOOL_NAMES = tuple(spec["name"] for spec in TOOL_SPECS)
 MCP_PROTOCOL_VERSION = "2025-11-25"
 BRIDGE_CONNECT_TIMEOUT_S = 1.0
 BRIDGE_READ_TIMEOUT_S = 5.0
+# Size limit semantics:
+# - *_MAX_REQUEST_LINE_BYTES and BRIDGE_MAX_LINE_BYTES are raw transport line bytes.
+# - *_MAX_*_BYTES for payload fields are UTF-8 encoded byte sizes.
 BRIDGE_MAX_LINE_BYTES = 1024 * 1024
 MCP_MAX_REQUEST_LINE_BYTES = 1024 * 1024
 SUBMIT_MAX_DIFF_BYTES = 256 * 1024
