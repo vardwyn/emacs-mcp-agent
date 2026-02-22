@@ -317,9 +317,14 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
            :service socket-path
            :server t
            :noquery t
+           :coding 'utf-8-unix
            :log #'emacs-mcp--socket-log
            :filter #'emacs-mcp--socket-filter
            :sentinel #'emacs-mcp--socket-sentinel))
+    (condition-case err
+        (set-process-coding-system emacs-mcp--socket-process 'utf-8-unix 'utf-8-unix)
+      (error
+       (emacs-mcp--server-log "Failed to set UTF-8 coding for server socket: %s" err)))
     (emacs-mcp--set-private-mode socket-path #o600)
     emacs-mcp--socket-process))
 
@@ -400,6 +405,10 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
 
 (defun emacs-mcp--register-client (process)
   "Register PROCESS in `emacs-mcp--connections`."
+  (condition-case err
+      (set-process-coding-system process 'utf-8-unix 'utf-8-unix)
+    (error
+     (emacs-mcp--server-log "Failed to set UTF-8 coding for client %s: %s" process err)))
   (puthash process (make-emacs-mcp-connection :process process :partial-input "") emacs-mcp--connections))
 
 (defun emacs-mcp--unregister-client (process)
