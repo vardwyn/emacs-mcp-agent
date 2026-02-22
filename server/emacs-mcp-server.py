@@ -1029,7 +1029,6 @@ class EmacsMcpServer:
         self._ensure_submit_state_dirs()
 
         active_index = self._load_active_index()
-        index_changed = False
 
         inbox_files = sorted(
             path
@@ -1060,10 +1059,9 @@ class EmacsMcpServer:
                     after_text=after_text,
                     after_exists=after_exists,
                 )
-                self._clear_active_file(rel_path, active_index)
-                index_changed = True
 
             feedback_id = self._allocate_feedback_id()
+            pending_path = self._pending_item_path(feedback_id)
             pending_item = {
                 "schema_version": 1,
                 "id": feedback_id,
@@ -1071,18 +1069,30 @@ class EmacsMcpServer:
                 "applied_diff": applied_diff,
                 "user_message": user_message,
             }
-            self._write_json_atomic(self._pending_item_path(feedback_id), pending_item)
+            self._write_json_atomic(pending_path, pending_item)
 
             try:
                 inbox_path.unlink()
             except OSError as exc:
-                raise ToolError(
-                    "io_error",
-                    f"Failed to delete processed feedback inbox event {inbox_path}: {exc}",
-                )
+                processed_path = inbox_path.with_suffix(f"{inbox_path.suffix}.processed")
+                try:
+                    os.replace(inbox_path, processed_path)
+                except OSError as quarantine_exc:
+                    try:
+                        pending_path.unlink()
+                    except OSError:
+                        pass
+                    raise ToolError(
+                        "io_error",
+                        (
+                            f"Failed to clear processed feedback inbox event {inbox_path}: {exc}; "
+                            f"failed to quarantine event: {quarantine_exc}"
+                        ),
+                    )
 
-        if index_changed:
-            self._save_active_index(active_index)
+            if isinstance(active_entry, dict):
+                self._clear_active_file(rel_path, active_index)
+                self._save_active_index(active_index)
 
     def _load_pending_item(self, pending_path: Path) -> dict[str, Any]:
         try:
