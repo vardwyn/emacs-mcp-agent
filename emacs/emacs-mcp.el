@@ -220,13 +220,20 @@ Raise an error when root is not configured."
    (list (read-directory-name "Project root: " nil nil t)))
   (unless project-root
     (user-error "Project root is required"))
-  (setq emacs-mcp-project-root
-        (emacs-mcp--canonicalize-project-root project-root))
-  (emacs-mcp--start-socket-server)
-  (emacs-mcp--install-kill-hook)
-  (message "emacs-mcp started on %s (root: %s)"
-           (emacs-mcp-socket-path)
-           (emacs-mcp-project-root)))
+  (let ((canonical-root (emacs-mcp--canonicalize-project-root project-root))
+        (previous-root emacs-mcp-project-root))
+    (emacs-mcp--ensure-socket-server-startable)
+    (setq emacs-mcp-project-root canonical-root)
+    (condition-case err
+        (progn
+          (emacs-mcp--start-socket-server t)
+          (emacs-mcp--install-kill-hook)
+          (message "emacs-mcp started on %s (root: %s)"
+                   (emacs-mcp-socket-path)
+                   (emacs-mcp-project-root)))
+      (error
+       (setq emacs-mcp-project-root previous-root)
+       (signal (car err) (cdr err))))))
 
 (defun emacs-mcp-stop ()
   "Stop emacs-mcp local socket server and cleanup socket path."
@@ -279,12 +286,8 @@ Raise an error when root is not configured."
     (remove-hook 'kill-emacs-hook #'emacs-mcp--cleanup-socket-file)
     (setq emacs-mcp--kill-hook-installed nil)))
 
-;; ---------------------------------------------------------------------------
-;; Socket server / transport module
-;; ---------------------------------------------------------------------------
-
-(defun emacs-mcp--start-socket-server ()
-  "Create local socket server process."
+(defun emacs-mcp--ensure-socket-server-startable ()
+  "Ensure socket path is ready for starting a local bridge server."
   (let ((socket-path (emacs-mcp-socket-path)))
     (when (emacs-mcp-running-p)
       (user-error "emacs-mcp socket server is already running"))
@@ -294,6 +297,19 @@ Raise an error when root is not configured."
           (user-error "Socket already in use by another emacs-mcp instance: %s" socket-path)
         (emacs-mcp--server-log "Removing stale socket file: %s" socket-path)
         (emacs-mcp--cleanup-socket-file)))
+    socket-path))
+
+;; ---------------------------------------------------------------------------
+;; Socket server / transport module
+;; ---------------------------------------------------------------------------
+
+(defun emacs-mcp--start-socket-server (&optional prechecked)
+  "Create local socket server process.
+When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
+  (let ((socket-path
+         (if prechecked
+             (emacs-mcp-socket-path)
+           (emacs-mcp--ensure-socket-server-startable))))
     (setq emacs-mcp--socket-process
           (make-network-process
            :name "emacs-mcp-socket-server"
