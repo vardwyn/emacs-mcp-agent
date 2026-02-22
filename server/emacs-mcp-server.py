@@ -883,6 +883,26 @@ class EmacsMcpServer:
                 break
             parent = parent.parent
 
+    def _rollback_submit_diff_active_entry(self, rel_path: str, index: dict[str, Any]) -> None:
+        """Best-effort rollback when Emacs append fails after creating active state."""
+        try:
+            self._clear_active_file(rel_path, index)
+        except Exception:
+            return
+
+        index_rolled_back = False
+        try:
+            self._save_active_index(index)
+            index_rolled_back = True
+        except Exception:
+            pass
+
+        if index_rolled_back:
+            try:
+                self._cleanup_before_snapshot(rel_path)
+            except Exception:
+                pass
+
     def _read_text_file(self, path: Path) -> str:
         try:
             return path.read_text(encoding="utf-8", errors="surrogateescape")
@@ -1257,15 +1277,19 @@ class EmacsMcpServer:
         self._ensure_submit_state_dirs()
         active_index = self._load_active_index()
         created_active_entry = self._create_before_snapshot_if_needed(path, abs_path, active_index)
-
-        normalized_diff = self._normalize_submission_diff(path, diff)
-        self.emacs_client.call(
-            "emacs.append_submission",
-            {"path": path, "description": description, "diff": normalized_diff},
-        )
-
         if created_active_entry:
             self._save_active_index(active_index)
+
+        normalized_diff = self._normalize_submission_diff(path, diff)
+        try:
+            self.emacs_client.call(
+                "emacs.append_submission",
+                {"path": path, "description": description, "diff": normalized_diff},
+            )
+        except Exception:
+            if created_active_entry:
+                self._rollback_submit_diff_active_entry(path, active_index)
+            raise
         return {"ok": True}
 
     def tool_feedback_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
