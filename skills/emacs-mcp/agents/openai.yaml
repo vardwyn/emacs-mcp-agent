@@ -1,0 +1,4 @@
+interface:
+  display_name: "emacs-mcp"
+  short_description: "Human review loop via Emacs"
+  default_prompt: "Use $emacs-mcp to propose changes to the files. Work normally, use `emacs.submit_diff` providing small chunks with detailed descriptions. Pull feedback only when I ask."
