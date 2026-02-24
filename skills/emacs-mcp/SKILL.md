@@ -28,7 +28,8 @@ When you are ready to modify code:
 2. For each chunk, do exactly one `emacs.submit_diff` call:
    - exactly one file (`path`)
    - exactly one logical change (one coherent intent)
-3. After submitting, stop and wait for the human to review/apply/save/finalize in Emacs.
+3. Submit all chunks required to complete the current task before pausing.
+4. After all required chunks are submitted, stop and wait for the human to review/apply/save/finalize in Emacs (unless the user explicitly asks you to pause earlier).
 
 ## `emacs.submit_diff` description requirements
 
