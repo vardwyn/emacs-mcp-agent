@@ -14,8 +14,8 @@ from typing import Any
 
 TOOL_SPECS = (
     {
-        "name": "emacs.ping",
-        "description": "Health check for Python MCP server + Emacs bridge.",
+        "name": "emacs.health",
+        "description": "Readiness check for Python MCP server + Emacs bridge.",
         "inputSchema": {
             "type": "object",
             "properties": {},
@@ -75,7 +75,11 @@ TOOL_SPECS = (
     },
 )
 TOOL_NAMES = tuple(spec["name"] for spec in TOOL_SPECS)
-MCP_PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_MCP_PROTOCOL_VERSIONS = ("2025-06-18", "2025-11-25")
+DEFAULT_MCP_PROTOCOL_VERSION = "2025-11-25"
+TOOLS_CALL_BASE_PARAM_KEYS = frozenset({"name", "arguments"})
+TOOLS_CALL_META_PARAM_KEYS = frozenset({"_meta"})
+TOOLS_CALL_TASK_PARAM_KEYS = frozenset({"task"})
 BRIDGE_CONNECT_TIMEOUT_S = 1.0
 BRIDGE_READ_TIMEOUT_S = 5.0
 # Size limit semantics:
@@ -123,6 +127,18 @@ def _tool_err(request_id: Any, code: str, message: str) -> dict[str, Any]:
 
 def _utf8_len(value: str) -> int:
     return len(value.encode("utf-8"))
+
+
+def _is_valid_request_id(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (str, int, float))
+
+
+def _is_valid_progress_token(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (str, int, float))
 
 
 @dataclass(frozen=True)
@@ -269,6 +285,8 @@ class EmacsMcpServer:
         self.paths = paths
         self.emacs_client = emacs_client
         self.is_initialized = False
+        self.client_initialized = False
+        self.negotiated_protocol_version: str | None = None
         self._ensure_private_dir(self.paths.socket_path.parent)
 
     def run(self) -> int:
@@ -321,33 +339,43 @@ class EmacsMcpServer:
         if not isinstance(request, dict):
             return _rpc_error(None, -32600, "Invalid Request")
 
-        request_id = request.get("id")
         has_id = "id" in request
+        request_id = request.get("id") if has_id else None
 
         jsonrpc = request.get("jsonrpc")
-        if jsonrpc is not None and jsonrpc != "2.0":
+        if jsonrpc != "2.0":
             return _rpc_error(request_id if has_id else None, -32600, "Invalid Request")
 
         method = request.get("method")
         if not isinstance(method, str) or not method:
-            return _rpc_error(request_id if has_id else None, -32600, "Invalid Request")
+            return None if not has_id else _rpc_error(request_id, -32600, "Invalid Request")
+
+        if has_id and not _is_valid_request_id(request_id):
+            return _rpc_error(None, -32600, "Invalid Request")
 
         params = request.get("params", {})
         if params is None:
             params = {}
+        if not isinstance(params, dict):
+            return None if not has_id else _rpc_error(request_id, -32602, "Invalid params: expected object")
 
         # JSON-RPC notifications (requests without "id") must not receive responses.
         if not has_id:
+            if method == "notifications/initialized":
+                self.client_initialized = True
             return None
+
+        if method == "ping":
+            return _rpc_result(request_id, {})
 
         if method == "initialize":
             if not self.is_initialized:
                 return self.handle_initialize(request_id=request_id, params=params)
             else:
-                return _rpc_error(request_id if has_id else None, -32600, "Already initialized")
+                return _rpc_error(request_id, -32600, "Already initialized")
 
         if not self.is_initialized:
-            return _rpc_error(request_id if has_id else None, -32602, "Server not initialized")
+            return _rpc_error(request_id, -32602, "Server not initialized")
 
         if method == "tools/list":
             return self.handle_tools_list(request_id=request_id)
@@ -364,26 +392,36 @@ class EmacsMcpServer:
             return _rpc_error(request_id, -32602, "Invalid params: expected object")
 
         requested = params.get("protocolVersion")
-        if requested is not None:
-            if not isinstance(requested, str):
-                return _rpc_error(
-                    request_id, -32602, "Invalid protocolVersion: expected string"
-                )
-            if requested != MCP_PROTOCOL_VERSION:
-                return _rpc_error(
-                    request_id,
-                    -32602,
-                    (
-                        f"Unsupported protocolVersion: {requested}. "
-                        f"Supported: {MCP_PROTOCOL_VERSION}"
-                    ),
-                )
+        if not isinstance(requested, str) or not requested:
+            return _rpc_error(request_id, -32602, "Invalid params: protocolVersion must be a string")
+
+        capabilities = params.get("capabilities")
+        if not isinstance(capabilities, dict):
+            return _rpc_error(request_id, -32602, "Invalid params: capabilities must be an object")
+
+        client_info = params.get("clientInfo")
+        if not isinstance(client_info, dict):
+            return _rpc_error(request_id, -32602, "Invalid params: clientInfo must be an object")
+        client_name = client_info.get("name")
+        client_version = client_info.get("version")
+        if not isinstance(client_name, str) or not client_name:
+            return _rpc_error(request_id, -32602, "Invalid params: clientInfo.name must be a string")
+        if not isinstance(client_version, str) or not client_version:
+            return _rpc_error(
+                request_id, -32602, "Invalid params: clientInfo.version must be a string"
+            )
+
+        protocol_version = (
+            requested if requested in SUPPORTED_MCP_PROTOCOL_VERSIONS else DEFAULT_MCP_PROTOCOL_VERSION
+        )
 
         self.is_initialized = True
+        self.client_initialized = False
+        self.negotiated_protocol_version = protocol_version
         return _rpc_result(
             request_id,
             {
-                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "protocolVersion": protocol_version,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "emacs-mcp-server", "version": "0.1.0"},
             },
@@ -404,27 +442,49 @@ class EmacsMcpServer:
     def handle_tools_call(self, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
         """Handle tools/call."""
         if not isinstance(params, dict):
-            return _tool_err(request_id, "invalid_arguments", "Invalid params: expected object")
-        unknown_keys = sorted(set(params.keys()) - {"name", "arguments"})
+            return _rpc_error(request_id, -32602, "Invalid params: expected object")
+
+        allowed_keys = set(TOOLS_CALL_BASE_PARAM_KEYS)
+        allowed_keys.update(TOOLS_CALL_META_PARAM_KEYS)
+        if self.negotiated_protocol_version == "2025-11-25":
+            allowed_keys.update(TOOLS_CALL_TASK_PARAM_KEYS)
+        unknown_keys = sorted(set(params.keys()) - allowed_keys)
         if unknown_keys:
-            return _tool_err(
-                request_id,
-                "invalid_arguments",
-                f"Invalid params: unexpected keys: {', '.join(unknown_keys)}",
+            return _rpc_error(
+                request_id, -32602, f"Invalid params: unexpected keys: {', '.join(unknown_keys)}"
             )
+
+        if "_meta" in params:
+            metadata = params.get("_meta")
+            if not isinstance(metadata, dict):
+                return _rpc_error(request_id, -32602, "Invalid params: _meta must be an object")
+            progress_token = metadata.get("progressToken")
+            if "progressToken" in metadata and not _is_valid_progress_token(progress_token):
+                return _rpc_error(
+                    request_id,
+                    -32602,
+                    "Invalid params: _meta.progressToken must be a string or number",
+                )
+
+        if "task" in params:
+            task_metadata = params.get("task")
+            if not isinstance(task_metadata, dict):
+                return _rpc_error(request_id, -32602, "Invalid params: task must be an object")
+            ttl = task_metadata.get("ttl")
+            if "ttl" in task_metadata and (
+                not isinstance(ttl, (int, float)) or isinstance(ttl, bool)
+            ):
+                return _rpc_error(request_id, -32602, "Invalid params: task.ttl must be a number")
 
         tool_name = params.get("name")
         if not isinstance(tool_name, str) or not tool_name:
-            return _tool_err(request_id, "invalid_arguments", "Missing or invalid tool name")
+            return _rpc_error(request_id, -32602, "Invalid params: missing or invalid tool name")
         if tool_name not in TOOL_NAMES:
-            message = f"Unknown tool: {tool_name}"
-            return _tool_err(request_id, "unknown_tool", message)
+            return _rpc_error(request_id, -32601, f"Unknown tool: {tool_name}")
 
         arguments = params.get("arguments", {})
         if not isinstance(arguments, dict):
-            return _tool_err(
-                request_id, "invalid_arguments", "Invalid arguments: expected object"
-            )
+            return _rpc_error(request_id, -32602, "Invalid params: arguments must be an object")
 
         try:
             validated_arguments = self.validate_tool_arguments(tool_name, arguments)
@@ -439,7 +499,7 @@ class EmacsMcpServer:
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
         validators: dict[str, Any] = {
-            "emacs.ping": self._validate_empty_arguments,
+            "emacs.health": self._validate_empty_arguments,
             "emacs.get_project_root": self._validate_empty_arguments,
             "emacs.get_selection": self._validate_empty_arguments,
             "emacs.feedback_list": self._validate_empty_arguments,
@@ -1223,7 +1283,7 @@ class EmacsMcpServer:
     def dispatch_tool(self, ctx: ToolCallContext) -> dict[str, Any]:
         """Route tool calls to concrete handlers."""
         handlers: dict[str, Any] = {
-            "emacs.ping": self.tool_ping,
+            "emacs.health": self.tool_health,
             "emacs.get_project_root": self.tool_get_project_root,
             "emacs.get_selection": self.tool_get_selection,
             "emacs.submit_diff": self.tool_submit_diff,
@@ -1235,7 +1295,7 @@ class EmacsMcpServer:
         return handler(ctx.arguments)
 
     # Tool handlers
-    def tool_ping(self, arguments: dict[str, Any]) -> dict[str, Any]:
+    def tool_health(self, arguments: dict[str, Any]) -> dict[str, Any]:
         python_project_root = os.path.realpath(str(self.paths.project_root))
         try:
             bridge_result = self.emacs_client.call("emacs.get_project_root", {})

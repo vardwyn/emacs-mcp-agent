@@ -387,8 +387,12 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
         (if drop-client
             (emacs-mcp--close-client process)
           (setf (emacs-mcp-connection-partial-input conn) partial)))
-    (emacs-mcp--server-log "Dropping untracked client in socket filter")
-    (emacs-mcp--close-client process)))
+    (emacs-mcp--server-log "Registering untracked client in socket filter")
+    (emacs-mcp--register-client process)
+    (if (gethash process emacs-mcp--connections)
+        (emacs-mcp--socket-filter process chunk)
+      (emacs-mcp--server-log
+       "Ignoring chunk: failed to register untracked client in socket filter"))))
 
 (defun emacs-mcp--socket-sentinel (process event)
   "Socket sentinel for PROCESS with EVENT."
