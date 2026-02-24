@@ -16,6 +16,7 @@ fi
 project_root="$(pwd -P)"
 xdg_cache_home="${XDG_CACHE_HOME:-$HOME/.cache}"
 cache_base="${EMACS_MCP_CACHE_DIR:-$xdg_cache_home/emacs-mcp}"
+codex_profile="${EMACS_MCP_CODEX_PROFILE:-emacs-mcp}"
 
 mkdir -p "$HOME/.codex" "$cache_base"
 
@@ -30,6 +31,7 @@ exec bwrap \
   --chdir "$project_root" \
   --setenv XDG_CACHE_HOME "$xdg_cache_home" \
   -- codex \
+     --profile "$codex_profile" \
      --sandbox workspace-write \
      --ask-for-approval untrusted \
      "$@"

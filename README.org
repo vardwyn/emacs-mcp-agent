@@ -81,14 +81,20 @@ In Doom Emacs using ~package!~ macro in ~~/.doom.d/packages.el~:
 
 ** Python MCP server (`server/emacs-mcp-server.py`)
 
-1. From the repo root, register it once:
+1. Add a dedicated Codex profile in `~/.codex/config.toml`:
+
+#+begin_src toml
+[profiles.emacs-mcp]
+#+end_src
+
+2. register the server in that profile:
 
 #+begin_src sh
 cd /path/to/emacs-mcp
-codex mcp add emacs -- python3 server/emacs-mcp-server.py
+codex --profile emacs-mcp mcp add emacs -- python3 /abs/path/to/server/emacs-mcp-server.py
 #+end_src
 
-2. Start Codex from the repo root (or use the wrapper script). The server computes:
+3. Start Codex from the repo root (or use the wrapper script). The server computes:
 
 - `project_root = realpath(os.getcwd())` at startup
 - socket/state/feedback under `${XDG_CACHE_HOME:-~/.cache}/emacs-mcp`
@@ -99,7 +105,8 @@ The repo includes `scripts/emacs-mcp-codex-runner.sh`, which runs Codex under `b
 
 - `/` mounted read-only (defense-in-depth: the agent cannot directly edit the repo)
 - writable bind mounts for `/tmp`, `~/.codex`, and `${XDG_CACHE_HOME:-$HOME/.cache}/emacs-mcp`
-- Codex launched with `--ask-for-approval untrusted`
+- Codex launched with `--profile emacs-mcp` and `--ask-for-approval untrusted`
+- profile name override via `EMACS_MCP_CODEX_PROFILE`
 
 Examples:
 
