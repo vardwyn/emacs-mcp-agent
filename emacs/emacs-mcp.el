@@ -654,7 +654,8 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
     (with-current-buffer buffer
       (unless (derived-mode-p 'org-mode)
         (org-mode))
-      (setq-local truncate-lines t))
+      ;; (setq-local truncate-lines t)
+      )
     buffer))
 
 (defun emacs-mcp-open-submissions ()
