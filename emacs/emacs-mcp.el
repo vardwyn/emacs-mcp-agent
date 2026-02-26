@@ -214,6 +214,7 @@ Raise an error when root is not configured."
   (and (processp emacs-mcp--socket-process)
        (process-live-p emacs-mcp--socket-process)))
 
+;;;###autoload
 (defun emacs-mcp-start (&optional project-root)
   "Start emacs-mcp local socket server with explicit PROJECT-ROOT."
   (interactive
@@ -235,6 +236,7 @@ Raise an error when root is not configured."
        (setq emacs-mcp-project-root previous-root)
        (signal (car err) (cdr err))))))
 
+;;;###autoload
 (defun emacs-mcp-stop ()
   "Stop emacs-mcp local socket server and cleanup socket path."
   (interactive)
@@ -654,10 +656,14 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
     (with-current-buffer buffer
       (unless (derived-mode-p 'org-mode)
         (org-mode))
+      (let ((project-root (ignore-errors (emacs-mcp-project-root))))
+        (when (stringp project-root)
+          (setq-local default-directory project-root)))
       ;; (setq-local truncate-lines t)
       )
     buffer))
 
+;;;###autoload
 (defun emacs-mcp-open-submissions ()
   "Open submissions buffer."
   (interactive)
@@ -666,6 +672,7 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
     (goto-char (point-max))
     buffer))
 
+;;;###autoload
 (defun emacs-mcp-open-review-layout ()
   "Open a review-focused 2-window layout."
   (interactive)
@@ -689,6 +696,7 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
           (dired project-root)))
       (select-window left-window))))
 
+;;;###autoload
 (defun emacs-mcp-open-target-at-point ()
   "Open/switch right pane to target file for submission at point."
   (interactive)
@@ -809,6 +817,7 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
       (error
        (user-error "Invalid finalize path: %s" (error-message-string err))))))
 
+;;;###autoload
 (defun emacs-mcp-finalize-file (path &optional user-message)
   "Finalize active cycle for PATH with optional USER-MESSAGE."
   (interactive
@@ -821,6 +830,7 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
     (message "emacs-mcp queued finalize event for %s" rel-path)
     event-path))
 
+;;;###autoload
 (defun emacs-mcp-finalize-current-buffer (&optional user-message)
   "Finalize current buffer file with optional USER-MESSAGE."
   (interactive (list (read-string "User message (optional): ")))
