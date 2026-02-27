@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import subprocess
 import sys
 import difflib
 import tempfile
@@ -1235,50 +1236,166 @@ class EmacsMcpServer:
             )
         return sorted(pending_paths, key=lambda path: int(path.stem))
 
+    def _raise_invalid_submit_diff(self, detail: str) -> None:
+        raise ToolError(
+            "invalid_arguments",
+            f"Invalid arguments for emacs.submit_diff: invalid diff: {detail}",
+        )
+
+    def _extract_unified_file_header_path(self, line: str, prefix: str) -> str:
+        assert line.startswith(prefix), f"Expected line to start with {prefix!r}"
+        path_with_suffix = line[len(prefix) :]
+        if "\t" in path_with_suffix:
+            return path_with_suffix.split("\t", 1)[0]
+        return path_with_suffix
+
+    def _submission_header_matches_target(self, header_path: str, rel_path: str) -> bool:
+        canonical_rel_path = Path(rel_path).as_posix()
+        return header_path in {
+            canonical_rel_path,
+            f"a/{canonical_rel_path}",
+            f"b/{canonical_rel_path}",
+        }
+
     def _normalize_submission_diff(self, rel_path: str, diff_text: str) -> str:
         path_for_header = Path(rel_path).as_posix()
+        normalized_text = diff_text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        if not normalized_text:
+            self._raise_invalid_submit_diff("empty diff text")
+
+        lines = normalized_text.split("\n")
+        first_hunk_index = next(
+            (index for index, line in enumerate(lines) if line.startswith("@@ ")),
+            None,
+        )
+        if first_hunk_index is None:
+            self._raise_invalid_submit_diff("expected at least one unified hunk header (`@@ ... @@`)")
+
+        if sum(1 for line in lines if line.startswith("diff --git ")) > 1:
+            self._raise_invalid_submit_diff("multiple file sections are not supported")
+
         prelude_prefixes = (
-            "diff --git ",
             "index ",
-            "--- ",
-            "+++ ",
             "new file mode ",
             "deleted file mode ",
             "old mode ",
             "new mode ",
             "similarity index ",
             "dissimilarity index ",
-            "rename from ",
-            "rename to ",
-            "Binary files ",
         )
 
-        lines = diff_text.splitlines()
-        body_lines: list[str] = []
-        in_body = False
-        for line in lines:
-            if not in_body:
-                if line.startswith("@@ "):
-                    in_body = True
-                    body_lines.append(line)
-                    continue
-                if line.startswith(prelude_prefixes) or line == "":
-                    continue
-                in_body = True
-                body_lines.append(line)
+        source_header: str | None = None
+        target_header: str | None = None
+        for line in lines[:first_hunk_index]:
+            if line == "":
                 continue
-            body_lines.append(line)
+            if line.startswith("```") or line.startswith("~~~"):
+                self._raise_invalid_submit_diff("markdown fences are not supported; submit raw unified diff")
+            if line.startswith("rename from ") or line.startswith("rename to "):
+                self._raise_invalid_submit_diff("rename patches are not supported")
+            if line.startswith("Binary files "):
+                self._raise_invalid_submit_diff("binary patches are not supported")
+            if line.startswith("diff --git "):
+                continue
+            if line.startswith("--- "):
+                if source_header is not None:
+                    self._raise_invalid_submit_diff("multiple `---` file headers are not supported")
+                source_header = self._extract_unified_file_header_path(line, "--- ")
+                continue
+            if line.startswith("+++ "):
+                if target_header is not None:
+                    self._raise_invalid_submit_diff("multiple `+++` file headers are not supported")
+                target_header = self._extract_unified_file_header_path(line, "+++ ")
+                continue
+            if line.startswith(prelude_prefixes):
+                continue
+            self._raise_invalid_submit_diff(f"unexpected prelude line before first hunk: {line!r}")
 
-        if not body_lines:
-            body_lines = lines
+        if (source_header is None) != (target_header is None):
+            self._raise_invalid_submit_diff("both `---` and `+++` file headers must be provided together")
 
-        canonical_header = [
+        operation = "modify"
+        if source_header is not None and target_header is not None:
+            source_is_dev_null = source_header == "/dev/null"
+            target_is_dev_null = target_header == "/dev/null"
+            if source_is_dev_null and target_is_dev_null:
+                self._raise_invalid_submit_diff("invalid file headers: both sides are /dev/null")
+
+            if source_is_dev_null:
+                if not self._submission_header_matches_target(target_header, rel_path):
+                    self._raise_invalid_submit_diff(
+                        "target file header does not match `path` argument for file creation"
+                    )
+                operation = "create"
+            elif target_is_dev_null:
+                if not self._submission_header_matches_target(source_header, rel_path):
+                    self._raise_invalid_submit_diff(
+                        "source file header does not match `path` argument for file deletion"
+                    )
+                operation = "delete"
+            else:
+                if not self._submission_header_matches_target(source_header, rel_path):
+                    self._raise_invalid_submit_diff(
+                        "source file header does not match `path` argument"
+                    )
+                if not self._submission_header_matches_target(target_header, rel_path):
+                    self._raise_invalid_submit_diff(
+                        "target file header does not match `path` argument"
+                    )
+
+        if operation == "create":
+            source_line = "--- /dev/null"
+            target_line = f"+++ b/{path_for_header}"
+        elif operation == "delete":
+            source_line = f"--- a/{path_for_header}"
+            target_line = "+++ /dev/null"
+        else:
+            source_line = f"--- a/{path_for_header}"
+            target_line = f"+++ b/{path_for_header}"
+
+        hunk_lines = lines[first_hunk_index:]
+        canonical_lines = [
             f"diff --git a/{path_for_header} b/{path_for_header}",
-            f"--- a/{path_for_header}",
-            f"+++ b/{path_for_header}",
+            source_line,
+            target_line,
         ]
-        normalized_lines = canonical_header + body_lines
-        return "\n".join(normalized_lines).rstrip("\n") + "\n"
+        canonical_lines.extend(hunk_lines)
+        return "\n".join(canonical_lines).rstrip("\n") + "\n"
+
+    def _validate_submission_diff_with_git(self, diff_text: str) -> None:
+        try:
+            process = subprocess.run(
+                [
+                    "git",
+                    "apply",
+                    "--check",
+                    "--recount",
+                    "--whitespace=nowarn",
+                    "--unidiff-zero",
+                    "-",
+                ],
+                cwd=str(self.paths.project_root),
+                input=diff_text.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        except OSError as exc:
+            raise ToolError("io_error", f"Failed to run git apply --check: {exc}")
+
+        if process.returncode == 0:
+            return
+
+        stderr_text = process.stderr.decode("utf-8", errors="replace")
+        stdout_text = process.stdout.decode("utf-8", errors="replace")
+        detail_source = stderr_text if stderr_text.strip() else stdout_text
+        detail = "git apply --check failed"
+        for line in detail_source.splitlines():
+            stripped = line.strip()
+            if stripped:
+                detail = stripped
+                break
+        self._raise_invalid_submit_diff(detail)
 
     def dispatch_tool(self, ctx: ToolCallContext) -> dict[str, Any]:
         """Route tool calls to concrete handlers."""
@@ -1337,18 +1454,28 @@ class EmacsMcpServer:
         assert isinstance(diff, str), "Validated argument 'diff' must be a string"
 
         abs_path = self._validate_path_from_tool(path, "emacs.submit_diff", "path")
+        normalized_diff = self._normalize_submission_diff(path, diff)
+        self._validate_submission_diff_with_git(normalized_diff)
+
         self._ensure_submit_state_dirs()
         active_index = self._load_active_index()
         created_active_entry = self._create_before_snapshot_if_needed(path, abs_path, active_index)
         if created_active_entry:
             self._save_active_index(active_index)
 
-        normalized_diff = self._normalize_submission_diff(path, diff)
         try:
             self.emacs_client.call(
                 "emacs.append_submission",
                 {"path": path, "description": description, "diff": normalized_diff},
             )
+        except ToolError as exc:
+            if created_active_entry:
+                self._rollback_submit_diff_active_entry(path, active_index)
+            invalid_params_prefix = "Emacs error invalid_params: "
+            if exc.code == "emacs_error" and exc.message.startswith(invalid_params_prefix):
+                detail = exc.message[len(invalid_params_prefix) :].strip()
+                self._raise_invalid_submit_diff(detail or "invalid unified hunk structure")
+            raise
         except Exception:
             if created_active_entry:
                 self._rollback_submit_diff_active_entry(path, active_index)

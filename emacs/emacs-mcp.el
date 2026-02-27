@@ -600,8 +600,45 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
   (let ((path (alist-get 'path params))
         (description (alist-get 'description params))
         (diff (alist-get 'diff params)))
+    (emacs-mcp--validate-submission-diff-text diff "emacs.append_submission")
     (emacs-mcp--append-submission-section path description diff)
     '((ok . t))))
+
+(defun emacs-mcp--validate-submission-diff-text (diff-text method)
+  "Validate DIFF-TEXT using `diff-mode` hunk sanity checks for METHOD."
+  (unless (and (stringp diff-text) (not (string-empty-p diff-text)))
+    (signal 'emacs-mcp-invalid-params
+            (list (format "Invalid params for %s: 'diff' must be a non-empty string" method))))
+  (require 'diff-mode)
+  (with-temp-buffer
+    (insert diff-text)
+    (unless (bolp)
+      (insert "\n"))
+    (diff-mode)
+    (goto-char (point-min))
+    (let ((found-hunk nil))
+      (while (re-search-forward "^@@ " nil t)
+        (setq found-hunk t)
+        (goto-char (match-beginning 0))
+        (condition-case err
+            (cl-letf (((symbol-function 'y-or-n-p)
+                       (lambda (&rest _args)
+                         (error "Diff hunk requires manual auto-fix"))))
+              (diff-sanity-check-hunk))
+          (error
+           (signal 'emacs-mcp-invalid-params
+                   (list
+                    (format
+                     "Invalid params for %s: invalid 'diff': %s"
+                     method
+                     (error-message-string err))))))
+        (diff-end-of-hunk))
+      (unless found-hunk
+        (signal 'emacs-mcp-invalid-params
+                (list
+                 (format
+                  "Invalid params for %s: invalid 'diff': expected at least one unified hunk"
+                  method)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Selection module
