@@ -785,65 +785,6 @@ section's `diff` source block and returns N."
         (when (and line-number (> line-number 0))
           line-number)))))
 
-(defun emacs-mcp--diff-src-block-at-point ()
-  "Return diff source block text at point.
-Point must be inside an Org source block with language `diff'."
-  (unless (derived-mode-p 'org-mode)
-    (user-error "Current buffer is not in org-mode"))
-  (unless (fboundp 'org-element-context)
-    (require 'org-element))
-  (let* ((context (org-element-context))
-         (src-block
-          (if (eq (org-element-type context) 'src-block)
-              context
-            (org-element-lineage context '(src-block) t))))
-    (unless src-block
-      (user-error "Point is not inside a source block"))
-    (let ((language (downcase (or (org-element-property :language src-block) ""))))
-      (unless (string= language "diff")
-        (user-error "Point is not inside a diff source block")))
-    (let ((contents-begin (org-element-property :contents-begin src-block))
-          (contents-end (org-element-property :contents-end src-block)))
-      (unless (and contents-begin contents-end (< contents-begin contents-end))
-        (user-error "Diff source block is empty"))
-      (buffer-substring-no-properties contents-begin contents-end))))
-
-;;;###autoload
-(defun emacs-mcp-apply-diff-at-point ()
-  "Apply diff source block at point relative to the project root.
-Use this command while reviewing submissions in `emacs-mcp-submissions-buffer-name'."
-  (interactive)
-  (unless (string= (buffer-name) emacs-mcp-submissions-buffer-name)
-    (user-error "Run this command from %s" emacs-mcp-submissions-buffer-name))
-  (let* ((project-root (emacs-mcp-project-root))
-         (diff-text (emacs-mcp--diff-src-block-at-point))
-         (output-buffer (get-buffer-create "*emacs-mcp apply-diff*"))
-         (default-directory project-root))
-    (with-current-buffer output-buffer
-      (erase-buffer))
-    (condition-case err
-        (with-temp-buffer
-          (insert diff-text)
-          (unless (bolp)
-            (insert "\n"))
-          (let ((exit-code
-                 (call-process-region (point-min)
-                                      (point-max)
-                                      "git"
-                                      nil
-                                      output-buffer
-                                      nil
-                                      "apply"
-                                      "--recount"
-                                      "--whitespace=nowarn"
-                                      "-")))
-            (if (and (integerp exit-code) (zerop exit-code))
-                (message "emacs-mcp applied diff at point (root: %s)" project-root)
-              (pop-to-buffer output-buffer)
-              (user-error "Failed to apply diff; see %s" (buffer-name output-buffer)))))
-      (file-missing
-       (user-error "Cannot run git apply: %s" (error-message-string err))))))
-
 (defun emacs-mcp--append-submission-section (path description diff)
   "Append one submission section for PATH, DESCRIPTION, and DIFF."
   (unless (stringp path)
