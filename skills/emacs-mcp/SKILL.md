@@ -24,14 +24,29 @@ description: Interact with the codebase and propose code changes via emacs MCP t
 
 When you are ready to modify code:
 
-1. Split the work into small, reviewable chunks.
-2. For each chunk, do exactly one `emacs.submit_diff` call:
+1. Split the work into small, reviewable logical chunks.
+2. Treat on-disk file contents as the single source of truth and read the target file with exact line numbers before each chunk.
+3. For each chunk, do exactly one `emacs.submit_apply_patch` call (primary path):
    - exactly one file (`path`)
    - exactly one logical change (one coherent intent)
-3. Submit all chunks required to complete the current task before pausing.
-4. After all required chunks are submitted, stop and wait for the human to review/apply/save/finalize in Emacs (unless the user explicitly asks you to pause earlier).
+4. Use `emacs.submit_diff` only as a fallback (for example, user explicitly provides/requests raw unified diff format).
+5. Prefer multiple submissions for one file when changes are logically distinct; do not force one monolithic patch per file.
+6. If a submission fails, regenerate from current on-disk contents; do not keep editing a previously failed patch/diff blindly.
+7. Submit all chunks required to complete the current task before pausing.
+8. After all required chunks are submitted, stop and wait for the human to review/apply/save/finalize in Emacs (unless the user explicitly asks you to pause earlier).
 
-## `emacs.submit_diff` description requirements
+## `emacs.submit_apply_patch` (primary write path)
+
+- Prefer this tool for normal code changes.
+- Write `patch` exactly in `apply_patch` envelope format:
+  - `*** Begin Patch`
+  - one file block (`*** Update File: ...` or `*** Add File: ...` or `*** Delete File: ...`)
+  - patch body hunks
+  - `*** End Patch`
+- Keep one call = one file + one logical intent.
+- Ensure tool argument `path` matches the file referenced in the patch header.
+
+## Submission description requirements
 
 The `description` must be detailed and review-friendly. Write it like an implementation plan + rationale, so the human can review without context switching.
 
@@ -42,12 +57,27 @@ Use this structure (adapt as needed, but keep it concrete):
 - **Implementation walkthrough**: step-by-step through the code and execution, assume low familiarity with a given language / technology stack
 - **Behavior / edge cases**: what this does for tricky inputs or failure modes.
 
-## Diff rules (hard constraints)
+## Submission rules (hard constraints)
 
-- One `emacs.submit_diff` call == one file and one small diff.
+- One submission call (`emacs.submit_apply_patch` or fallback `emacs.submit_diff`) == one file and one small logical change.
+- The same file may be submitted multiple times when changes are split into logical review hunks.
 - `path` must be repo-relative (no absolute paths, no `..`).
 - Keep hunks tight and reviewable; split large work into multiple submissions.
-- Ensure the diff text ends with a newline.
+- Ensure patch/diff text ends with a newline.
+- Do not run extra pre-submit dry-run checks; submit and use server feedback for corrections.
+
+
+## Submission recovery loop (strict)
+
+1. Classify the exact error from `emacs.submit_apply_patch` (or fallback `emacs.submit_diff`).
+2. For apply-patch format errors: re-read on-disk file with exact line numbers, regenerate patch from scratch, and resubmit smaller logical hunks.
+3. Malformed diff/hunk errors (fallback `emacs.submit_diff` path): regenerate from scratch with fresh context and smaller hunks.
+4. Path errors: fix `path` to repo-relative form and resubmit.
+5. Size-limit errors: split description/patch/diff into smaller logical submissions and resubmit.
+6. `emacs_unreachable`: ask user to start/restart bridge; retry only when ready.
+7. `root_mismatch`: stop and ask user to align roots before continuing.
+8. Unknown server errors: retry once with fresh on-disk context; if it fails again, report exact error and next fix.
+9. Continue until accepted or blocked by user-required action.
 
 ## `emacs.get_selection` (discussion-only context)
 
@@ -71,4 +101,5 @@ When asked:
 ## Avoid / invariants
 
 - Proceeding past `root_mismatch` (results become invalid).
-- Mutating repo files via local edits/commands instead of `emacs.submit_diff`.
+- Mutating repo files via local edits/commands instead of MCP submission tools.
+- Using `emacs.submit_diff` as the default path when `emacs.submit_apply_patch` is applicable.
