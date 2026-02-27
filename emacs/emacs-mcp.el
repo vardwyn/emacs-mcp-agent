@@ -739,6 +739,7 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
   (interactive)
   (let* ((rel-path (emacs-mcp--submission-path-at-point))
          (abs-path (emacs-mcp--resolve-project-path rel-path))
+         (target-line (emacs-mcp--submission-target-line-at-point))
          (target-buffer (find-file-noselect abs-path))
          (target-window
           (if (= (count-windows) 1)
@@ -746,7 +747,102 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
             (or (window-in-direction 'right)
                 (next-window)))))
     (set-window-buffer target-window target-buffer)
-    (message "emacs-mcp opened target: %s" rel-path)))
+    (when target-line
+      (with-current-buffer target-buffer
+        (goto-char (point-min))
+        (forward-line (max 0 (1- target-line)))
+        (set-window-point target-window (point)))
+      (with-selected-window target-window
+        (recenter)))
+    (if target-line
+        (message "emacs-mcp opened target: %s (approx line %d)" rel-path target-line)
+      (message "emacs-mcp opened target: %s" rel-path))))
+
+(defun emacs-mcp--submission-target-line-at-point ()
+  "Return first target hunk line number for submission at point, or nil.
+
+This parses the first `@@ ... +N,... @@` header in the current Org submission
+section's `diff` source block and returns N."
+  (when (derived-mode-p 'org-mode)
+    (save-excursion
+      (unless (fboundp 'org-back-to-heading)
+        (require 'org))
+      (org-back-to-heading t)
+      (let ((section-end (save-excursion (org-end-of-subtree t t)))
+            (line-number nil))
+        (when (re-search-forward "^#\\+begin_src\\s-+diff\\s-*$" section-end t)
+          (let ((block-start (match-end 0)))
+            (when (re-search-forward "^#\\+end_src\\s-*$" section-end t)
+              (let* ((block-end (match-beginning 0))
+                     (diff-text (buffer-substring-no-properties block-start block-end)))
+                (with-temp-buffer
+                  (insert diff-text)
+                  (goto-char (point-min))
+                  (when (re-search-forward
+                         "^@@ -[0-9]+\\(?:,[0-9]+\\)? +\\+\\([0-9]+\\)\\(?:,[0-9]+\\)? @@"
+                         nil t)
+                    (setq line-number (string-to-number (match-string 1)))))))))
+        (when (and line-number (> line-number 0))
+          line-number)))))
+
+(defun emacs-mcp--diff-src-block-at-point ()
+  "Return diff source block text at point.
+Point must be inside an Org source block with language `diff'."
+  (unless (derived-mode-p 'org-mode)
+    (user-error "Current buffer is not in org-mode"))
+  (unless (fboundp 'org-element-context)
+    (require 'org-element))
+  (let* ((context (org-element-context))
+         (src-block
+          (if (eq (org-element-type context) 'src-block)
+              context
+            (org-element-lineage context '(src-block) t))))
+    (unless src-block
+      (user-error "Point is not inside a source block"))
+    (let ((language (downcase (or (org-element-property :language src-block) ""))))
+      (unless (string= language "diff")
+        (user-error "Point is not inside a diff source block")))
+    (let ((contents-begin (org-element-property :contents-begin src-block))
+          (contents-end (org-element-property :contents-end src-block)))
+      (unless (and contents-begin contents-end (< contents-begin contents-end))
+        (user-error "Diff source block is empty"))
+      (buffer-substring-no-properties contents-begin contents-end))))
+
+;;;###autoload
+(defun emacs-mcp-apply-diff-at-point ()
+  "Apply diff source block at point relative to the project root.
+Use this command while reviewing submissions in `emacs-mcp-submissions-buffer-name'."
+  (interactive)
+  (unless (string= (buffer-name) emacs-mcp-submissions-buffer-name)
+    (user-error "Run this command from %s" emacs-mcp-submissions-buffer-name))
+  (let* ((project-root (emacs-mcp-project-root))
+         (diff-text (emacs-mcp--diff-src-block-at-point))
+         (output-buffer (get-buffer-create "*emacs-mcp apply-diff*"))
+         (default-directory project-root))
+    (with-current-buffer output-buffer
+      (erase-buffer))
+    (condition-case err
+        (with-temp-buffer
+          (insert diff-text)
+          (unless (bolp)
+            (insert "\n"))
+          (let ((exit-code
+                 (call-process-region (point-min)
+                                      (point-max)
+                                      "git"
+                                      nil
+                                      output-buffer
+                                      nil
+                                      "apply"
+                                      "--recount"
+                                      "--whitespace=nowarn"
+                                      "-")))
+            (if (and (integerp exit-code) (zerop exit-code))
+                (message "emacs-mcp applied diff at point (root: %s)" project-root)
+              (pop-to-buffer output-buffer)
+              (user-error "Failed to apply diff; see %s" (buffer-name output-buffer)))))
+      (file-missing
+       (user-error "Cannot run git apply: %s" (error-message-string err))))))
 
 (defun emacs-mcp--append-submission-section (path description diff)
   "Append one submission section for PATH, DESCRIPTION, and DIFF."
