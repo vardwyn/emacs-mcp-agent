@@ -5,7 +5,7 @@
 
 emacs-mcp is a minimal Model Context Protocol (MCP) tool surface designed for a human-in-the-loop Emacs workflow:
 
-- A *Python MCP server* (stdio JSON-RPC) exposes a small set of tools (`emacs.submit_diff`, `emacs.get_selection`, feedback tools)
+- A *Python MCP server* (stdio JSON-RPC) exposes a small set of tools (`emacs.submit_apply_patch`, `emacs.submit_diff`, `emacs.get_selection`, feedback tools)
 - An *Emacs bridge* (`emacs/emacs-mcp.el`) listens on a local Unix socket and provides a review UI (an Org submissions buffer + navigation helpers).
 - The agent *proposes* small changes via MCP; a human *reviews/applies/saves* in Emacs and then *finalizes per file* to send feedback back to the agent.
 
@@ -23,7 +23,7 @@ emacs-mcp is a minimal Model Context Protocol (MCP) tool surface designed for a 
 
 ** Review loop (multi-step, long sessions)
 
-1. Agent proposes one small change at a time via `emacs.submit_diff`:
+1. Agent proposes one small change at a time (prefer `emacs.submit_apply_patch`; use `emacs.submit_diff` as fallback):
    - exactly one file (`path`)
    - exactly one logical change per call
 2. In Emacs, review in the submissions buffer:
@@ -81,17 +81,13 @@ In Doom Emacs using ~package!~ macro in ~~/.doom.d/packages.el~:
 
 ** Python MCP server (`server/emacs-mcp-server.py`)
 
-1. Add a dedicated Codex profile in `~/.codex/config.toml`:
+1. Ensure the MCP server script exists (default runner path is `server/emacs-mcp-server.py` from repo root):
 
-#+begin_src toml
-[profiles.emacs-mcp]
-#+end_src
-
-2. register the server in that profile:
+2. No global `codex mcp add` registration is required when using the runner. The runner injects `mcp_servers.emacs` for that session via `-c` overrides.
 
 #+begin_src sh
 cd /path/to/emacs-mcp
-codex --profile emacs-mcp mcp add emacs -- python3 /abs/path/to/server/emacs-mcp-server.py
+test -f /path/to/emacs-mcp/server/emacs-mcp-server.py
 #+end_src
 
 3. Start Codex from the repo root (or use the wrapper script). The server computes:
@@ -99,20 +95,44 @@ codex --profile emacs-mcp mcp add emacs -- python3 /abs/path/to/server/emacs-mcp
 - `project_root = realpath(os.getcwd())` at startup
 - socket/state/feedback under `${XDG_CACHE_HOME:-~/.cache}/emacs-mcp`
 
+If you do not use the default repo path, set:
+
+#+begin_src sh
+export EMACS_MCP_SERVER_PATH="/path/to/mcp/server/emacs-mcp-server.py"
+#+end_src
+
 ** Codex wrapper (recommended)
 
 The repo includes `scripts/emacs-mcp-codex-runner.sh`, which runs Codex under `bwrap` with:
 
 - `/` mounted read-only (defense-in-depth: the agent cannot directly edit the repo)
 - writable bind mounts for `/tmp`, `~/.codex`, and `${XDG_CACHE_HOME:-$HOME/.cache}/emacs-mcp`
-- Codex launched with `--profile emacs-mcp` and `--ask-for-approval untrusted`
-- profile name override via `EMACS_MCP_CODEX_PROFILE`
+- Codex launched with `--sandbox workspace-write` and `--ask-for-approval untrusted`
+- session MCP server is injected via `-c mcp_servers.emacs.*` (no global `mcp add`)
+- repo skill path is bind-mounted read-only to `~/.codex/skills/emacs-mcp` for this runner session
+
+This wrapper overlays emacs-mcp server + skill only for this run; plain `codex` sessions continue using your normal global config.
+
+Environment variables used by the runner:
+
+- `EMACS_MCP_SERVER_PATH` (default: `$PWD/server/emacs-mcp-server.py`)
+- `EMACS_MCP_SKILL_PATH` (default: `$PWD/skills/emacs-mcp`)
+- `EMACS_MCP_CODEX_PROFILE` (optional: prepend `--profile <name>`)
+- `EMACS_MCP_CACHE_DIR` (optional: override `${XDG_CACHE_HOME:-$HOME/.cache}/emacs-mcp`) #+end_src
 
 Examples:
 
 #+begin_src sh
-# start a new interactive session (from repo root)
+# start a new interactive session with emacs-mcp overlay (from repo root)
 scripts/emacs-mcp-codex-runner.sh
+
+# use server + skill from user-local install paths
+EMACS_MCP_SERVER_PATH="/path/to/emacs-mcp-server.py" \
+EMACS_MCP_SKILL_PATH="/path/to/skills/emacs-mcp" \
+scripts/emacs-mcp-codex-runner.sh
+
+# include an existing global profile plus emacs-mcp overlay
+EMACS_MCP_CODEX_PROFILE=my-default scripts/emacs-mcp-codex-runner.sh
 
 # resume last session
 scripts/emacs-mcp-codex-runner.sh resume --last
@@ -122,12 +142,20 @@ scripts/emacs-mcp-codex-runner.sh resume --last
 
 This repo contains a Codex “skill” definition in `skills/emacs-mcp/`.
 
-Install by symlinking or copying into your Codex skills directory (commonly `~/.codex/skills`):
+No global skill installation is required when using the runner.
+It bind-mounts `skills/emacs-mcp` to `~/.codex/skills/emacs-mcp` for that session only, so plain `codex` runs do not automatically load this skill.
+
+Place the skill in one of these locations:
+- default (no env var needed): `$PWD/skills/emacs-mcp`
+- user-local install: `/path/to/skills/emacs-mcp`
+
+If you do not use the default repo path, set:
 
 #+begin_src sh
-mkdir -p ~/.codex/skills
-ln -s /path/to/emacs-mcp/skills/emacs-mcp ~/.codex/skills/emacs-mcp
+export EMACS_MCP_SKILL_PATH="/path/to/skills/emacs-mcp"
 #+end_src
+
+The runner bind-mounts the configured skill path to `~/.codex/skills/emacs-mcp` for that session only, so plain `codex` runs do not automatically load this skill.
 
 The skill’s intent is: work normally, but propose file changes only via `emacs.submit_diff` in small single-file chunks, and only read feedback when the user explicitly asks.
 
