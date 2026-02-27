@@ -56,6 +56,20 @@ TOOL_SPECS = (
         },
     },
     {
+        "name": "emacs.submit_apply_patch",
+        "description": "Submit an apply_patch-format patch for one file; server converts it to unified diff for Emacs review.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string"},
+                "description": {"type": "string"},
+                "patch": {"type": "string"},
+            },
+            "required": ["path", "description", "patch"],
+            "additionalProperties": False,
+        },
+    },
+    {
         "name": "emacs.feedback_list",
         "description": "List unread per-file feedback items.",
         "inputSchema": {
@@ -89,6 +103,7 @@ BRIDGE_READ_TIMEOUT_S = 5.0
 BRIDGE_MAX_LINE_BYTES = 1024 * 1024
 MCP_MAX_REQUEST_LINE_BYTES = 1024 * 1024
 SUBMIT_MAX_DIFF_BYTES = 256 * 1024
+SUBMIT_MAX_PATCH_BYTES = 256 * 1024
 SUBMIT_MAX_DESCRIPTION_BYTES = 256 * 1024
 SELECTION_MAX_TEXT_BYTES = 256 * 1024
 SELECTION_MAX_FILE_BYTES = 16 * 1024
@@ -505,6 +520,7 @@ class EmacsMcpServer:
             "emacs.get_selection": self._validate_empty_arguments,
             "emacs.feedback_list": self._validate_empty_arguments,
             "emacs.submit_diff": self._validate_submit_diff_arguments,
+            "emacs.submit_apply_patch": self._validate_submit_apply_patch_arguments,
             "emacs.feedback_get": self._validate_feedback_get_arguments,
         }
         validator = validators.get(tool_name)
@@ -561,6 +577,51 @@ class EmacsMcpServer:
             )
 
         return {"path": path, "description": description, "diff": diff}
+
+    def _validate_submit_apply_patch_arguments(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        self._validate_allowed_keys(arguments, {"path", "description", "patch"}, tool_name)
+        path = arguments.get("path")
+        description = arguments.get("description")
+        patch = arguments.get("patch")
+
+        if not isinstance(path, str) or not path:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'path' must be a non-empty string",
+            )
+        self._validate_path_from_tool(path, tool_name, "path")
+
+        if not isinstance(description, str) or not description:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'description' must be a non-empty string",
+            )
+        if _utf8_len(description) > SUBMIT_MAX_DESCRIPTION_BYTES:
+            raise ToolError(
+                "invalid_arguments",
+                (
+                    f"Invalid arguments for {tool_name}: 'description' is too large "
+                    f"(max {SUBMIT_MAX_DESCRIPTION_BYTES} bytes)"
+                ),
+            )
+
+        if not isinstance(patch, str) or not patch:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for {tool_name}: 'patch' must be a non-empty string",
+            )
+        if _utf8_len(patch) > SUBMIT_MAX_PATCH_BYTES:
+            raise ToolError(
+                "invalid_arguments",
+                (
+                    f"Invalid arguments for {tool_name}: 'patch' is too large "
+                    f"(max {SUBMIT_MAX_PATCH_BYTES} bytes)"
+                ),
+            )
+
+        return {"path": path, "description": description, "patch": patch}
 
     def _validate_feedback_get_arguments(
         self, tool_name: str, arguments: dict[str, Any]
@@ -1242,6 +1303,183 @@ class EmacsMcpServer:
             f"Invalid arguments for emacs.submit_diff: invalid diff: {detail}",
         )
 
+    def _generate_diff_from_apply_patch(
+        self,
+        rel_path: str,
+        abs_path: Path,
+        patch_text: str,
+    ) -> str:
+        def invalid(detail: str) -> None:
+            raise ToolError(
+                "invalid_arguments",
+                f"Invalid arguments for emacs.submit_apply_patch: invalid patch: {detail}",
+            )
+
+        def parse_header(line: str) -> tuple[str, str] | None:
+            prefixes = (
+                ("update", "*** Update File: "),
+                ("add", "*** Add File: "),
+                ("delete", "*** Delete File: "),
+            )
+            for operation, prefix in prefixes:
+                if line.startswith(prefix):
+                    return (operation, line[len(prefix) :])
+            return None
+
+        normalized_text = patch_text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+        if not normalized_text:
+            invalid("empty patch text")
+
+        lines = normalized_text.split("\n")
+        if lines[0] != "*** Begin Patch":
+            invalid("missing '*** Begin Patch' header")
+        if lines[-1] != "*** End Patch":
+            invalid("missing '*** End Patch' footer")
+
+        body_lines = lines[1:-1]
+        if not body_lines:
+            invalid("patch body is empty")
+
+        header = parse_header(body_lines[0])
+        if header is None:
+            invalid("expected one of: Update File, Add File, Delete File")
+        operation, patch_path = header
+        if not patch_path:
+            invalid("patch file path is empty")
+
+        canonical_target = Path(rel_path).as_posix()
+        canonical_patch_path = Path(patch_path).as_posix()
+        if canonical_patch_path != canonical_target:
+            invalid(f"patch file path does not match 'path' argument: {patch_path!r}")
+
+        for line in body_lines[1:]:
+            if parse_header(line) is not None:
+                invalid("multiple file sections are not supported")
+
+        before_text: str
+        before_exists: bool
+        after_text: str
+        after_exists: bool
+
+        if operation == "add":
+            if abs_path.exists():
+                invalid("add patch target already exists on disk")
+            add_lines = body_lines[1:]
+            if not add_lines:
+                invalid("add patch has no content")
+            for line in add_lines:
+                if not line.startswith("+"):
+                    invalid(f"invalid add patch line (expected '+'): {line!r}")
+            before_text = ""
+            before_exists = False
+            after_text = "\n".join(line[1:] for line in add_lines) + "\n"
+            after_exists = True
+        elif operation == "delete":
+            if len(body_lines) != 1:
+                invalid("delete patch must not include change lines")
+            before_text, before_exists = self._read_after_state(abs_path, rel_path)
+            if not before_exists:
+                invalid("delete patch target does not exist on disk")
+            after_text = ""
+            after_exists = False
+        else:
+            before_text, before_exists = self._read_after_state(abs_path, rel_path)
+            if not before_exists:
+                invalid("update patch target does not exist on disk")
+
+            update_lines = body_lines[1:]
+            if not update_lines:
+                invalid("update patch has no body")
+            if update_lines[0].startswith("*** Move to: "):
+                invalid("move/rename directives are not supported")
+
+            chunks: list[list[str]] = []
+            current_chunk: list[str] | None = None
+            saw_change_line = False
+            for line in update_lines:
+                if line.startswith("@@"):
+                    current_chunk = []
+                    chunks.append(current_chunk)
+                    continue
+                if line == "*** End of File":
+                    continue
+                if line.startswith("*** "):
+                    invalid(f"unsupported update directive: {line!r}")
+                if not line or line[0] not in {" ", "+", "-"}:
+                    invalid(f"invalid update patch line (expected @@/+/-/space): {line!r}")
+                if current_chunk is None:
+                    invalid("update patch is missing '@@' before change lines")
+                current_chunk.append(line)
+                saw_change_line = True
+
+            if not chunks:
+                invalid("update patch is missing '@@' sections")
+            if not saw_change_line:
+                invalid("update patch does not contain any change lines")
+
+            source_lines = before_text.splitlines()
+            had_trailing_newline = before_text.endswith("\n")
+            working_lines = list(source_lines)
+            cursor = 0
+
+            def find_match_index(needle: list[str], start_index: int) -> int:
+                if not needle:
+                    return max(0, min(start_index, len(working_lines)))
+
+                max_start = len(working_lines) - len(needle)
+                if max_start < 0:
+                    invalid(f"update chunk does not match target file ({rel_path})")
+
+                forward_matches = [
+                    index
+                    for index in range(max(0, start_index), max_start + 1)
+                    if working_lines[index : index + len(needle)] == needle
+                ]
+                if len(forward_matches) == 1:
+                    return forward_matches[0]
+                if len(forward_matches) > 1:
+                    invalid(f"update chunk is ambiguous in target file ({rel_path})")
+
+                all_matches = [
+                    index
+                    for index in range(0, max_start + 1)
+                    if working_lines[index : index + len(needle)] == needle
+                ]
+                if len(all_matches) == 1:
+                    return all_matches[0]
+                if len(all_matches) > 1:
+                    invalid(f"update chunk is ambiguous in target file ({rel_path})")
+
+                invalid(f"update chunk context not found in target file ({rel_path})")
+
+            for chunk in chunks:
+                before_chunk = [line[1:] for line in chunk if line[0] in {" ", "-"}]
+                after_chunk = [line[1:] for line in chunk if line[0] in {" ", "+"}]
+                match_index = find_match_index(before_chunk, cursor)
+                working_lines[match_index : match_index + len(before_chunk)] = after_chunk
+                cursor = match_index + len(after_chunk)
+
+            if not working_lines:
+                after_text = ""
+            else:
+                after_text = "\n".join(working_lines)
+                if had_trailing_newline or not source_lines:
+                    after_text += "\n"
+            after_exists = True
+
+        generated_diff = self._generate_applied_diff(
+            rel_path,
+            before_text,
+            before_exists,
+            after_text,
+            after_exists,
+        )
+        if not generated_diff:
+            invalid("patch produces no file changes")
+        if _utf8_len(generated_diff) > SUBMIT_MAX_DIFF_BYTES:
+            invalid(f"generated diff is too large (max {SUBMIT_MAX_DIFF_BYTES} bytes)")
+        return generated_diff
+
     def _extract_unified_file_header_path(self, line: str, prefix: str) -> str:
         assert line.startswith(prefix), f"Expected line to start with {prefix!r}"
         path_with_suffix = line[len(prefix) :]
@@ -1403,6 +1641,7 @@ class EmacsMcpServer:
             "emacs.health": self.tool_health,
             "emacs.get_project_root": self.tool_get_project_root,
             "emacs.get_selection": self.tool_get_selection,
+            "emacs.submit_apply_patch": self.tool_submit_apply_patch,
             "emacs.submit_diff": self.tool_submit_diff,
             "emacs.feedback_list": self.tool_feedback_list,
             "emacs.feedback_get": self.tool_feedback_get,
@@ -1481,6 +1720,20 @@ class EmacsMcpServer:
                 self._rollback_submit_diff_active_entry(path, active_index)
             raise
         return {"ok": True}
+
+    def tool_submit_apply_patch(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        path = arguments.get("path")
+        description = arguments.get("description")
+        patch = arguments.get("patch")
+        assert isinstance(path, str), "Validated argument 'path' must be a string"
+        assert isinstance(description, str), "Validated argument 'description' must be a string"
+        assert isinstance(patch, str), "Validated argument 'patch' must be a string"
+
+        abs_path = self._validate_path_from_tool(path, "emacs.submit_apply_patch", "path")
+        generated_diff = self._generate_diff_from_apply_patch(path, abs_path, patch)
+        return self.tool_submit_diff(
+            {"path": path, "description": description, "diff": generated_diff}
+        )
 
     def tool_feedback_list(self, arguments: dict[str, Any]) -> dict[str, Any]:
         self._process_feedback_inbox()
