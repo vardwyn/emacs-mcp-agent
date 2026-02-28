@@ -118,7 +118,7 @@ Environment variables used by the runner:
 - `EMACS_MCP_SERVER_PATH` (default: `$PWD/server/emacs-mcp-server.py`)
 - `EMACS_MCP_SKILL_PATH` (default: `$PWD/skills/emacs-mcp`)
 - `EMACS_MCP_CODEX_PROFILE` (optional: prepend `--profile <name>`)
-- `EMACS_MCP_CACHE_DIR` (optional: override `${XDG_CACHE_HOME:-$HOME/.cache}/emacs-mcp`) #+end_src
+- `EMACS_MCP_CACHE_DIR` (optional: override `${XDG_CACHE_HOME:-$HOME/.cache}/emacs-mcp`)
 
 Examples:
 
