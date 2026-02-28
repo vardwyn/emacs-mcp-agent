@@ -864,6 +864,126 @@ section's `diff` source block and returns N."
   (format "* %s [%s]" path timestamp))
 
 ;; ---------------------------------------------------------------------------
+;; Active session module
+;; ---------------------------------------------------------------------------
+
+(defconst emacs-mcp-active-index-schema-version 1
+  "Schema version expected in active index state.")
+
+(defun emacs-mcp-state-dir ()
+  "Return emacs-mcp state directory under cache."
+  (expand-file-name "state" (emacs-mcp-cache-dir)))
+
+(defun emacs-mcp-active-dir ()
+  "Return active-state directory path."
+  (expand-file-name "active" (emacs-mcp-state-dir)))
+
+(defun emacs-mcp-active-before-dir ()
+  "Return BEFORE snapshots directory path."
+  (expand-file-name "before" (emacs-mcp-active-dir)))
+
+(defun emacs-mcp-active-index-path ()
+  "Return active index JSON file path."
+  (expand-file-name "index.json" (emacs-mcp-active-dir)))
+
+(defun emacs-mcp--empty-active-index-payload ()
+  "Build empty active index payload object."
+  (let ((empty-active-files (make-hash-table :test #'equal)))
+    `((schema_version . ,emacs-mcp-active-index-schema-version)
+      (active_files . ,empty-active-files))))
+
+(defun emacs-mcp--load-active-index-paths ()
+  "Load active index and return sorted repo-relative file paths."
+  (let ((index-path (emacs-mcp-active-index-path)))
+    (if (not (file-exists-p index-path))
+        '()
+      (condition-case err
+          (let* ((raw-text
+                  (with-temp-buffer
+                    (insert-file-contents index-path)
+                    (buffer-string)))
+                 (json-object-type 'alist)
+                 (json-array-type 'list)
+                 (json-key-type 'string)
+                 (json-false :json-false)
+                 (json-null nil)
+                 (raw-index (json-read-from-string raw-text)))
+            (unless (and (listp raw-index) (cl-every #'consp raw-index))
+              (error "Active index root must be a JSON object"))
+            (let ((schema-version (alist-get "schema_version" raw-index nil nil #'equal))
+                  (active-files (alist-get "active_files" raw-index nil nil #'equal))
+                  (paths '()))
+              (unless (equal schema-version emacs-mcp-active-index-schema-version)
+                (error
+                 "Unsupported active index schema %S (expected %d)"
+                 schema-version
+                 emacs-mcp-active-index-schema-version))
+              (unless (and (listp active-files) (cl-every #'consp active-files))
+                (error "Active index 'active_files' must be an object"))
+              (dolist (entry active-files)
+                (let ((rel-path (car entry)))
+                  (unless (and (stringp rel-path) (not (string-empty-p rel-path)))
+                    (error "Active index path key must be a non-empty string"))
+                  (condition-case path-err
+                      (emacs-mcp--validate-repo-relative-path rel-path)
+                    (error
+                     (error
+                      "Invalid active index path %S: %s"
+                      rel-path
+                      (error-message-string path-err))))
+                  (push rel-path paths)))
+              (sort paths #'string<)))
+        (error
+         (user-error "Failed to load active index %s: %s"
+                     index-path
+                     (error-message-string err)))))))
+
+(defun emacs-mcp--reset-active-index-state ()
+  "Reset active cache state to empty index + empty BEFORE snapshots."
+  (let ((active-dir (emacs-mcp-active-dir))
+        (before-dir (emacs-mcp-active-before-dir)))
+    (make-directory active-dir t)
+    (emacs-mcp--set-private-mode active-dir #o700)
+    (when (file-directory-p before-dir)
+      (delete-directory before-dir t))
+    (make-directory before-dir t)
+    (emacs-mcp--set-private-mode before-dir #o700)
+    (emacs-mcp--atomic-write-json
+     (emacs-mcp-active-index-path)
+     (emacs-mcp--empty-active-index-payload))))
+
+;;;###autoload
+(defun emacs-mcp-list-active-files ()
+  "List all active files tracked in active index state."
+  (interactive)
+  (let* ((paths (emacs-mcp--load-active-index-paths))
+         (buffer (get-buffer-create "*emacs-mcp active files*")))
+    (with-current-buffer buffer
+      (setq buffer-read-only nil)
+      (erase-buffer)
+      (insert (format "emacs-mcp active files: %d\n\n" (length paths)))
+      (if paths
+          (dolist (path paths)
+            (insert (format "- %s\n" path)))
+        (insert "(none)\n"))
+      (goto-char (point-min))
+      (view-mode 1))
+    (pop-to-buffer buffer)
+    paths))
+
+;;;###autoload
+(defun emacs-mcp-clear-active-files ()
+  "Remove all active files and reset active cache state to fresh/empty."
+  (interactive)
+  (let* ((paths (emacs-mcp--load-active-index-paths))
+         (removed-count (length paths)))
+    (emacs-mcp--reset-active-index-state)
+    (message "emacs-mcp cleared %d active file entries" removed-count)
+    `((ok . t)
+      (removed_count . ,removed-count)
+      (removed_paths . ,paths))))
+
+;; ---------------------------------------------------------------------------
 ;; Feedback module
 ;; ---------------------------------------------------------------------------
 
