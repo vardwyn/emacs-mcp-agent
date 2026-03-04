@@ -1072,6 +1072,12 @@ class EmacsMcpServer:
         fromfile = f"a/{path_for_header}" if before_exists else "/dev/null"
         tofile = f"b/{path_for_header}" if after_exists else "/dev/null"
 
+        operation = "modify"
+        if not before_exists and after_exists:
+            operation = "create"
+        elif before_exists and not after_exists:
+            operation = "delete"
+
         body_lines = list(
             difflib.unified_diff(
                 before_text.splitlines(),
@@ -1082,10 +1088,20 @@ class EmacsMcpServer:
             )
         )
         if not body_lines:
-            return ""
+            if operation == "create":
+                body_lines = [f"--- {fromfile}", f"+++ {tofile}"]
+            elif operation == "delete":
+                body_lines = [f"--- {fromfile}", f"+++ {tofile}"]
+            else:
+                return ""
 
-        header = f"diff --git a/{path_for_header} b/{path_for_header}\n"
-        return header + "\n".join(body_lines).rstrip("\n") + "\n"
+        canonical_lines = [f"diff --git a/{path_for_header} b/{path_for_header}"]
+        if operation == "create":
+            canonical_lines.append("new file mode 100644")
+        elif operation == "delete":
+            canonical_lines.append("deleted file mode 100644")
+        canonical_lines.extend(body_lines)
+        return "\n".join(canonical_lines).rstrip("\n") + "\n"
 
     def _feedback_next_id_path(self) -> Path:
         return self.paths.feedback_dir / "next_id.txt"
@@ -1506,8 +1522,6 @@ class EmacsMcpServer:
             (index for index, line in enumerate(lines) if line.startswith("@@ ")),
             None,
         )
-        if first_hunk_index is None:
-            self._raise_invalid_submit_diff("expected at least one unified hunk header (`@@ ... @@`)")
 
         if sum(1 for line in lines if line.startswith("diff --git ")) > 1:
             self._raise_invalid_submit_diff("multiple file sections are not supported")
@@ -1524,7 +1538,8 @@ class EmacsMcpServer:
 
         source_header: str | None = None
         target_header: str | None = None
-        for line in lines[:first_hunk_index]:
+        prelude_end = first_hunk_index if first_hunk_index is not None else len(lines)
+        for line in lines[:prelude_end]:
             if line == "":
                 continue
             if line.startswith("```") or line.startswith("~~~"):
@@ -1581,6 +1596,9 @@ class EmacsMcpServer:
                         "target file header does not match `path` argument"
                     )
 
+        if operation == "modify" and first_hunk_index is None:
+            self._raise_invalid_submit_diff("expected at least one unified hunk header (`@@ ... @@`)")
+
         if operation == "create":
             source_line = "--- /dev/null"
             target_line = f"+++ b/{path_for_header}"
@@ -1591,12 +1609,15 @@ class EmacsMcpServer:
             source_line = f"--- a/{path_for_header}"
             target_line = f"+++ b/{path_for_header}"
 
-        hunk_lines = lines[first_hunk_index:]
+        hunk_lines = lines[first_hunk_index:] if first_hunk_index is not None else []
         canonical_lines = [
             f"diff --git a/{path_for_header} b/{path_for_header}",
-            source_line,
-            target_line,
         ]
+        if operation == "create":
+            canonical_lines.append("new file mode 100644")
+        elif operation == "delete":
+            canonical_lines.append("deleted file mode 100644")
+        canonical_lines.extend([source_line, target_line])
         canonical_lines.extend(hunk_lines)
         return "\n".join(canonical_lines).rstrip("\n") + "\n"
 
