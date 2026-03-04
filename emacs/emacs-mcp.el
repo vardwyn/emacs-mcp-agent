@@ -759,30 +759,63 @@ When PRECHECKED is non-nil, startup preconditions are assumed to be satisfied."
       (message "emacs-mcp opened target: %s" rel-path))))
 
 (defun emacs-mcp--submission-target-line-at-point ()
-  "Return first target hunk line number for submission at point, or nil.
+  "Return approximate target line for submission at point, or nil.
 
-This parses the first `@@ ... +N,... @@` header in the current Org submission
-section's `diff` source block and returns N."
+When point is inside a diff hunk, return a line near the current hunk position.
+When point is outside all hunks, fall back to the first hunk."
   (when (derived-mode-p 'org-mode)
-    (save-excursion
-      (unless (fboundp 'org-back-to-heading)
-        (require 'org))
-      (org-back-to-heading t)
-      (let ((section-end (save-excursion (org-end-of-subtree t t)))
-            (line-number nil))
-        (when (re-search-forward "^#\\+begin_src\\s-+diff\\s-*$" section-end t)
-          (let ((block-start (match-end 0)))
-            (when (re-search-forward "^#\\+end_src\\s-*$" section-end t)
-              (let* ((block-end (match-beginning 0))
-                     (diff-text (buffer-substring-no-properties block-start block-end)))
-                (with-temp-buffer
-                  (insert diff-text)
-                  (goto-char (point-min))
-                  (when (re-search-forward
-                         "^@@ -[0-9]+\\(?:,[0-9]+\\)? +\\+\\([0-9]+\\)\\(?:,[0-9]+\\)? @@"
-                         nil t)
-                    (setq line-number (string-to-number (match-string 1)))))))))
-        (when (and line-number (> line-number 0))
+    (let ((origin (point)))
+      (save-excursion
+        (unless (fboundp 'org-back-to-heading)
+          (require 'org))
+        (org-back-to-heading t)
+        (let ((section-end (save-excursion (org-end-of-subtree t t)))
+              (line-number nil))
+          (when (re-search-forward "^#\\+begin_src\\s-+diff\\s-*$" section-end t)
+            (let ((block-start (match-end 0)))
+              (when (re-search-forward "^#\\+end_src\\s-*$" section-end t)
+                (let* ((block-end (match-beginning 0))
+                       (hunks nil)
+                       (hunk-regexp "^@@ .* @@\\s-*$"))
+                  (save-excursion
+                    (goto-char block-start)
+                    (while (re-search-forward hunk-regexp block-end t)
+                      (let* ((header-line (string-trim-right (match-string-no-properties 0)))
+                             (target-start
+                              (emacs-mcp--target-line-from-hunk-header header-line)))
+                        (when target-start
+                          (push (list :start (line-beginning-position)
+                                      :line target-start)
+                                hunks)))))
+                  (setq hunks (nreverse hunks))
+                  (when hunks
+                    (let* ((current-hunk
+                            (cl-find-if
+                             (lambda (hunk)
+                               (let* ((rest (member hunk hunks))
+                                      (next (cadr rest))
+                                      (start (plist-get hunk :start))
+                                      (end (if next (plist-get next :start) block-end)))
+                                 (and (>= origin start)
+                                      (< origin end))))
+                             hunks))
+                           (selected-hunk (or current-hunk (car hunks))))
+                      (setq line-number (plist-get selected-hunk :line))))))))
+          (when (and line-number (> line-number 0))
+            line-number))))))
+
+(defun emacs-mcp--target-line-from-hunk-header (header-line)
+  "Parse and return target start line from unified hunk HEADER-LINE.
+
+HEADER-LINE should be in the form `@@ -A[,B] +C[,D] @@ ...`.
+Returns C as an integer when parseable and positive; otherwise nil."
+  (let* ((tokens (split-string header-line "[ \t]+" t))
+         (plus-token (cl-find-if (lambda (token) (string-prefix-p "+" token))
+                                 tokens)))
+    (when (and plus-token
+               (string-match "\\`+\\([0-9]+\\)\\(?:,[0-9]+\\)?\\'" plus-token))
+      (let ((line-number (string-to-number (match-string 1 plus-token))))
+        (when (> line-number 0)
           line-number)))))
 
 (defun emacs-mcp--append-submission-section (path description diff)
